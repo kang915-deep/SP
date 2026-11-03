@@ -38,10 +38,23 @@ flock -n 9 || { echo "Use the public entry point: bash start.sh DATA_DISK GPU_ID
 work="$1"
 export CUDA_VISIBLE_DEVICES="$2" CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false
-export HF_HOME="$work/cache/huggingface" PIP_CACHE_DIR="$work/cache/pip"
-export UV_CACHE_DIR="$work/cache/uv" UV_PYTHON_INSTALL_DIR="$work/python"
-export TORCH_EXTENSIONS_DIR="$work/cache/torch-extensions" TRITON_CACHE_DIR="$work/cache/triton"
-export TMPDIR="$work/tmp" VSI_BENCH_DIR="$work/vsi-bench"
+runtime="${VEGA_RUNTIME_DIR:-$work}"
+# venv creates lib64 -> lib even in --copies mode on 64-bit Linux.
+if [[ -z ${VEGA_RUNTIME_DIR:-} && ! -L "$work/.runtime-link-check" ]] &&
+   ! ln -s launch.lock "$work/.runtime-link-check" 2>/dev/null; then
+  key="$(printf '%s' "$work" | sha256sum | cut -c1-16)"
+  runtime="${XDG_CACHE_HOME:-$HOME/.cache}/qwen3-vega/$key"
+fi
+mkdir -p "$runtime"
+runtime="$(cd "$runtime" && pwd -P)"
+if [[ ! -L "$runtime/.runtime-link-check" ]] && ! ln -s .runtime-link-target "$runtime/.runtime-link-check"; then
+  echo "Set VEGA_RUNTIME_DIR to a writable local Linux directory that supports symlinks." >&2
+  exit 1
+fi
+export HF_HOME="$runtime/cache/huggingface" PIP_CACHE_DIR="$runtime/cache/pip"
+export UV_CACHE_DIR="$runtime/cache/uv" UV_PYTHON_INSTALL_DIR="$runtime/python"
+export TORCH_EXTENSIONS_DIR="$runtime/cache/torch-extensions" TRITON_CACHE_DIR="$runtime/cache/triton"
+export TMPDIR="$runtime/tmp" VSI_BENCH_DIR="$work/vsi-bench"
 if [[ -x "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" ]]; then
   export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
   export PATH="$CUDA_HOME/bin:$PATH"
@@ -49,20 +62,21 @@ fi
 mkdir -p "$TMPDIR"
 trap 'echo "Launch failed at line $LINENO (exit $?). See preceding error."' ERR
 echo "Workspace: $work"
-df -h "$work"
+echo "Software runtime: $runtime"
+df -h "$work" "$runtime"
 echo "Assigned GPUs: $CUDA_VISIBLE_DEVICES"
 cd "$repo"
-envdir="$work/env"
+envdir="$runtime/env"
 if [[ ! -f "$envdir/bin/activate" ]]; then
-  # Keep all packages on the data disk. Reuse system wheels only for the tested torch build.
+  # Reuse system wheels only for the tested torch build.
   py=""
   for name in python3.12 python3.11 python3; do
     if command -v "$name" >/dev/null && "$name" -c 'import ensurepip, sys, venv; sys.exit(sys.version_info[:2] not in [(3,11),(3,12)])' 2>/dev/null; then py="$name"; break; fi
   done
   if [[ -z "$py" ]]; then
-    python3 -m pip install --target "$work/bootstrap" 'uv==0.8.22'
-    "$work/bootstrap/bin/uv" python install 3.12
-    py="$("$work/bootstrap/bin/uv" python find --managed-python 3.12)"
+    python3 -m pip install --target "$runtime/bootstrap" 'uv==0.8.22'
+    "$runtime/bootstrap/bin/uv" python install 3.12
+    py="$("$runtime/bootstrap/bin/uv" python find --managed-python 3.12)"
   fi
   flags=()
   if "$py" -c 'import torch,torchvision; assert torch.__version__=="2.8.0+cu128" and torchvision.__version__.split("+")[0]=="0.23.0"' >/dev/null 2>&1; then flags+=(--system-site-packages); fi
@@ -84,11 +98,11 @@ if torch.version.cuda != "12.8" or torch.cuda.device_count() != 4:
 for i in range(4):
     print(i, torch.cuda.get_device_name(i), torch.cuda.mem_get_info(i))
 PY
-upstream="$work/upstream/VEGA-3D"
+upstream="$runtime/upstream/VEGA-3D"
 rev=ca64583b3f961849a6a0a282a3c16918321adf87
 if [[ ! -d "$upstream" ]]; then
-  mkdir -p "$work/upstream"
-  staging="$(mktemp -d "$work/upstream/clone-XXXXXX")"
+  mkdir -p "$runtime/upstream"
+  staging="$(mktemp -d "$runtime/upstream/clone-XXXXXX")"
   git -C "$staging" init -q
   git -C "$staging" fetch --depth 1 --no-tags https://github.com/H-EmbodVis/VEGA-3D.git "$rev"
   git -C "$staging" checkout --detach FETCH_HEAD
