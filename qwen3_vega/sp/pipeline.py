@@ -95,7 +95,7 @@ def main():
                 str(args.wan),
                 "--export",
                 str(export),
-                "--run",
+                "--feature-dir",
                 str(root),
                 "--parts",
                 *parts,

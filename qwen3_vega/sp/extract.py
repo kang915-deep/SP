@@ -242,7 +242,7 @@ class Extractor:
 @torch.inference_mode()
 def main():
     p = argparse.ArgumentParser()
-    for k in ("qwen", "wan", "export", "run"):
+    for k in ("qwen", "wan", "export", "feature-dir"):
         p.add_argument("--" + k, type=Path, required=True)
     p.add_argument("--parts", nargs="+", required=True)
     args = p.parse_args()
@@ -253,15 +253,15 @@ def main():
         args.qwen,
         args.wan,
         args.export,
-        torch.load(args.run / "context.pt", weights_only=True),
+        torch.load(args.feature_dir / "context.pt", weights_only=True),
         torch.device("cuda", rank),
     )
-    banks = read(args.run / "banks.json")
+    banks = read(args.feature_dir / "banks.json")
     for part in args.parts:
-        folder = args.run / "features" / part
+        folder = args.feature_dir / "features" / part
         folder.mkdir(parents=True, exist_ok=True)
         groups = defaultdict(list)
-        for row in read(args.run / (part + ".json")):
+        for row in read(args.feature_dir / (part + ".json")):
             groups[row["media"]].append(row)
         # Assign a whole video to one worker to reuse both visual encoders.
         shards = [[] for _ in range(world)]
