@@ -80,7 +80,40 @@ nvidia-smi --id="$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,utilization.
 
 意外中断后，选输出目录中最新的 `step-XXXXXX.json`，在原启动命令末尾加上例如 `--resume step-000250`。保持原世界大小、micro-batch、优化器位置和数据。新运行和不同配置使用各自的输出目录。
 
-## 5. 导出和复核
+## 5. 自动接训 16K SP，评测完整 VSI-Bench
+
+**第 4 节的四卡命令包含整个流程。** VEGA 完成一轮并选定权重后，脚本导出该检查点，冻结底座，训练 SP，然后输出同一底座加 SP 前后的完整 VSI 成绩。中途的 `--stop-after` 吞吐测试不会触发后续阶段。
+
+| 阶段 | 设置与产物 |
+|---|---|
+| 取样 | 从底座实际使用的 234,277 条 VSI 视频 QA 中，用 seed 42 按来源和题型比例重新抽 16,000 条。训练样本与底座重合。验证 2,036 条、确认 2,049 条沿用原独立划分。这批训练题与旧 Qwen2.5 版 VEGA 的历史 16K 分开记录。 |
+| 训练 SP | 按媒体分给已指定的四张卡提特征，SP 小头在第一张卡训练。原回答和候选由入选的 Qwen3-VEGA 产生。使用候选与上下文隐藏状态、候选概率、数值关系，以及独立从 16 帧视频提取的 Wan block 20 记忆。 |
+| 选模 | 宽 128，FP32 AdamW，batch 32，utility KL 温度 0.25。只在验证集校准每类改答门槛，按视频等权得分选 epoch，同分优先少改坏。最少 10 轮，按平台降学习率，最多 160 轮。若到上限仍未满足平台判据，报告中标记 `adequacy_passed=false`。 |
+| 完整 VSI | 底座每个视频均匀取最多 32 帧，贪心解码，最多生成 16 个 token。SP 从同一个原回答决定保留或改答，额外 Wan 记忆使用 16 帧。未校准的题型保留原答。冻结选模及门槛后，对 5,130 题成对计分。 |
+
+正式训练成功后，结果位于 `$WORK/runs/full01/sp16k_vsi/`。
+
+- `results.json` 包含 VEGA 分数、VEGA＋SP 分数、差值、改好/改坏题数和各题型结果。总分按官方八类宏平均，方向题三个难度先平均。
+- `benchmark_predictions.json` 和 `per_question_scores.json` 保存逐题的原答、SP 答案及得分变化。数值题按相对误差获得部分分。
+- `export/` 是选中的 VEGA 基座，`sp.pt` 和 `sp_selection.json` 是配套 SP 权重、改答门槛与训练曲线。`confirm_results.json` 是独立确认集结果。
+
+VSI-Bench 默认从官方固定版本下载，3 个视频 ZIP 合计约 5.73 GB，解压还需要约一份视频的空间。SP 首次生成固定文本嵌入还需要 Wan 的 UMT5 权重，可复用已有的官方 Wan 目录。另留空间保存按视频分片的候选与 Wan 特征。仅想提前下载 VSI 时可以单独执行下面的命令。[官方数据源](https://huggingface.co/datasets/nyu-visionx/VSI-Bench/tree/3a6a1cf9ac54c403509b15260897cc6ddc41b408)
+
+```bash
+# 正式训练开始后，或者提前在单独的缓存目录下载
+python qwen3_vega/sp/prepare.py --output "$WORK/vsi-cache"
+```
+
+若 VEGA 已在旧版本上训练完成，或下载、提特征等后续步骤意外中断，可在原机器上直接执行下列命令。它复用原检查点、已完成的视频特征以及最近完整的 SP 训练轮次。指定预下载目录时会复用该目录中的视频和标注。
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export VSI_BENCH_DIR="$WORK/vsi-cache"   # 可选，供预下载和多个实验共用
+python qwen3_vega/sp/pipeline.py --output "$WORK/runs/full01" \
+  --qwen "$WORK/assets/qwen" --wan "$WORK/assets/wan" --data "$WORK/data"
+```
+
+## 6. 单独导出并复核验证 Loss
 
 ```bash
 python qwen3_vega/export.py --run "$WORK/runs/full01" --output "$WORK/artifacts/best"
