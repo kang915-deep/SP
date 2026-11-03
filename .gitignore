@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+assets/
+data/
+fixture/
+runs/
+artifacts/
+downloads/
+third_party/
+*.safetensors
+*.pt
+*.pth
+*.mp4
+*.tar.gz
+*.log
+.env

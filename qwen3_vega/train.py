@@ -1,0 +1,194 @@
+"""Portable data-parallel VEGA training on explicitly selected A800 GPUs."""
+import argparse
+import hashlib
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+import deepspeed
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from qwen_vl.model.generative_encoders.encoder import GenerativeEncoderConfig, GenerativeVisionEncoder
+from batched_vega import BatchedVega
+from data import prepare, sample_seed
+from train_model import FrozenEncoders
+from model_buffers import snapshot_buffers, restore_buffers
+from wan_sdpa import configure_attention
+
+parser = argparse.ArgumentParser()
+for name in ("qwen", "wan", "data", "output"):
+    parser.add_argument("--" + name, required=True, type=Path)
+parser.add_argument("--resume", help="Committed step tag in the same output directory")
+parser.add_argument("--smoke", action="store_true", help="Real 8B+Wan forward; update final decoder layer and fusion only")
+parser.add_argument("--micro-batch", type=int, default=1)
+parser.add_argument("--cpu-adam", action="store_true", help="Offload FP32 optimizer states to host RAM (slower, less VRAM)")
+parser.add_argument("--workers", type=int, default=2)
+parser.add_argument("--stop-after", type=int, help="Commit an optimizer checkpoint and exit after this global step")
+parser.add_argument("--save-every", type=int, default=250)
+args = parser.parse_args()
+rank, world, local = (int(os.environ[k]) for k in ("RANK","WORLD_SIZE","LOCAL_RANK"))
+if args.workers < 0 or args.save_every < 1:
+    parser.error('workers must be nonnegative and save-every must be positive')
+width = args.micro_batch
+effective_batch = world * width if args.smoke else 64
+if not os.environ.get("CUDA_VISIBLE_DEVICES") or width < 1 or effective_batch % (world * width):
+    parser.error("Set CUDA_VISIBLE_DEVICES explicitly; global batch must be divisible by world size * micro batch")
+torch.cuda.set_device(local)
+device = torch.device("cuda",local)
+dist.init_process_group("nccl",device_id=device)
+torch.manual_seed(0)
+data_dir = args.data.resolve()
+raw = (data_dir/"train.json").read_bytes()
+rows = json.loads(raw)
+tune = json.loads((data_dir/"tune.json").read_text())
+if not rows or not tune or (not args.smoke and (len(rows),len(tune)) != (298027,2036)):
+    raise ValueError("Unexpected train/tune size")
+if not args.smoke and not (data_dir/"media_ready.json").is_file():
+    raise ValueError("Finish the verified media preparation before full training")
+protocol = {"train_sha256":hashlib.sha256(raw).hexdigest(),"tune_sha256":hashlib.sha256((data_dir/"tune.json").read_bytes()).hexdigest(),
+            "world":world,"micro_batch":width,"effective_batch":effective_batch,"smoke":args.smoke,"cpu_adam":args.cpu_adam}
+out = args.output.resolve()
+if rank == 0:
+    if args.resume:
+        assert json.loads((out/"protocol.json").read_text()) == protocol
+        if (out/"selected.json").exists() or sorted(out.glob("step-*.json"))[-1].stem!=args.resume:
+            raise ValueError("Resume the latest committed step of an unfinished run")
+    else:
+        out.mkdir(parents=True,exist_ok=False)
+        (out/"protocol.json").write_text(json.dumps(protocol))
+dist.barrier()
+processor = AutoProcessor.from_pretrained(args.qwen,local_files_only=True)
+qwen = Qwen3VLForConditionalGeneration.from_pretrained(args.qwen,dtype=torch.bfloat16,attn_implementation="sdpa",local_files_only=True)
+configure_attention()
+wan = GenerativeVisionEncoder(GenerativeEncoderConfig(tower_type="wan_t2v_online",checkpoint=str(args.wan.resolve())))
+enc = FrozenEncoders(qwen.model.visual,wan)
+qwen.model.visual = None
+model = BatchedVega(qwen)
+qwen.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
+if args.smoke:
+    qwen.requires_grad_(False)
+    qwen.model.language_model.layers[-1].requires_grad_(True)
+buffers = snapshot_buffers(model)
+model.bfloat16()
+enc.activate(device)
+params = [(n,p) for n,p in model.named_parameters() if p.requires_grad]
+norm_ids={id(p) for m in model.modules() if isinstance(m,torch.nn.LayerNorm) or "RMSNorm" in type(m).__name__
+          for p in m.parameters(recurse=False)}
+decay=[];no_decay=[]
+for name,p in params:
+    (no_decay if "bias" in name or id(p) in norm_ids or name.endswith("norm_weight") else decay).append(p)
+groups=[{"params":decay,"weight_decay":0.01},{"params":no_decay,"weight_decay":0.0}]
+accum = effective_batch//(world*width)
+config = {"train_batch_size":effective_batch,"train_micro_batch_size_per_gpu":width,"gradient_accumulation_steps":accum,
+          "gradient_clipping":1.0,"bf16":{"enabled":True},"zero_allow_untested_optimizer":True,
+          "zero_optimization":{"stage":2,"overlap_comm":True,"contiguous_gradients":True,
+                              "reduce_bucket_size":50000000,"allgather_bucket_size":50000000},"steps_per_print":10000}
+if args.cpu_adam:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+    config["zero_optimization"]["offload_optimizer"]={"device":"cpu","pin_memory":True}
+    optimizer=DeepSpeedCPUAdam(groups,lr=1e-5,betas=(0.9,0.999),eps=1e-8)
+else:
+    optimizer=torch.optim.AdamW(groups,lr=1e-5,betas=(0.9,0.999),eps=1e-8,fused=True)
+engine,_,_,_=deepspeed.initialize(model=model,optimizer=optimizer,config=config)
+restore_buffers(engine.module,buffers,device)
+start=0
+best=None
+if args.resume:
+    loaded,state=engine.load_checkpoint(str(out/"checkpoints"),tag=args.resume,load_module_strict=not args.smoke)
+    if not loaded or state["protocol"]!=protocol:
+        raise ValueError("Checkpoint does not match the run")
+    start=state["step"];best=state["best"]
+    assert engine.global_steps==start
+for row in rows+tune:
+    row["path"]=str(data_dir/row["path"])
+order=sorted(range(len(rows)),key=lambda i:hashlib.sha256(("train-order-0:"+rows[i]["id"]).encode()).digest())
+total=math.ceil(len(rows)/effective_batch)
+validation_steps={math.ceil(total*f) for f in (.25,.5,.75,1.)}
+if args.stop_after is not None and not start<args.stop_after<=total:raise ValueError("stop-after outside remaining budget")
+
+class Examples:
+    def __init__(self,split,indices):
+        self.split=split;self.indices=indices
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self,i):
+        index,valid=self.indices[i]
+        row=self.split[index]
+        return row["id"],valid,prepare(row,processor)
+
+def as_list(items):
+    return items
+
+def loader(split,indices,batch_size):
+    return DataLoader(Examples(split,indices),batch_size=batch_size,num_workers=args.workers,
+                      pin_memory=True,collate_fn=as_list)
+
+def forward(batch,phase):
+    features=[]
+    for qid,_,example in batch:
+        torch.manual_seed(sample_seed(qid,0,phase))
+        features.append(enc.encode(example,device))
+    return engine(**features[0]).reshape(1) if len(features)==1 else engine(examples=features)
+
+indices=[]
+for pos in range(start*effective_batch,total*effective_batch,world*width):
+    for i in range(pos+rank*width,pos+(rank+1)*width):
+        indices.append((order[min(i,len(rows)-1)],i<len(rows)))
+batches=iter(loader(rows,indices,width))
+if rank==0:print("READY",json.dumps(dict(protocol,trainable=sum(p.numel() for _,p in params),start=start)),flush=True)
+for step in range(start,total):
+    begin=time.perf_counter()
+    n=min(effective_batch,len(rows)-step*effective_batch)
+    warmup=math.ceil(total*.03)
+    factor=step/warmup if step<warmup else .5*(1+math.cos(math.pi*(step-warmup)/(total-warmup)))
+    for group in engine.optimizer.param_groups:group["lr"]=1e-5*factor
+    ce=torch.zeros((),device=device)
+    for micro in range(accum):
+        batch=next(batches)
+        values=forward(batch,"train")
+        valid=sum(item[1] for item in batch)
+        loss=values[:valid].sum()
+        engine.backward(loss*(world*accum/n))
+        engine.step()
+        ce+=loss.detach()
+    dist.all_reduce(ce)
+    completed=step+1
+    if not torch.isfinite(ce):raise FloatingPointError(f"Nonfinite loss at step {completed}")
+    elapsed=time.perf_counter()-begin
+    event={"step":completed,"train_ce":ce.item()/n,"qa_per_s":n/elapsed,"seconds":elapsed,
+           "peak_gpu_gib":torch.cuda.max_memory_allocated(device)/2**30,"lr":1e-5*factor}
+    if completed in validation_steps:
+        engine.eval()
+        # Match standalone export verification even when training uses padded batches.
+        count=math.ceil(len(tune)/world)*world
+        slots=[(min(i,len(tune)-1),i<len(tune)) for i in range(rank,count,world)]
+        stats=torch.zeros(2,device=device,dtype=torch.float64)
+        with torch.no_grad():
+            for batch in loader(tune,slots,1):
+                values=forward(batch,"validation")
+                valid=sum(item[1] for item in batch)
+                stats[0]+=values[:valid].double().sum();stats[1]+=valid
+        dist.all_reduce(stats)
+        if stats[1].item()!=len(tune) or not torch.isfinite(stats[0]):raise ValueError("Invalid validation reduction")
+        event["tune_ce"]=(stats[0]/stats[1]).item()
+        if best is None or event["tune_ce"]<best["tune_ce"]:
+            best={"step":completed,"tune_ce":event["tune_ce"]}
+        engine.train()
+    if rank==0:
+        print("STEP",json.dumps(event),flush=True)
+        with (out/"metrics.jsonl").open("a") as f:f.write(json.dumps(event)+"\n")
+    if completed in validation_steps or completed % args.save_every==0 or completed==args.stop_after:
+        tag=f"step-{completed:06d}"
+        engine.save_checkpoint(str(out/"checkpoints"),tag=tag,save_latest=False,exclude_frozen_parameters=args.smoke,
+                               client_state={"protocol":protocol,"step":completed,"best":best})
+        dist.barrier()
+        if rank==0:
+            with (out/(tag+".json")).open("x") as f:json.dump({"step":completed,"best":best},f)
+    if completed==args.stop_after:break
+if completed==total and rank==0:
+    (out/"selected.json").write_text(json.dumps(dict(best,tag=f"step-{best['step']:06d}")))
+dist.destroy_process_group()
