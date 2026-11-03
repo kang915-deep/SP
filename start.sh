@@ -47,6 +47,7 @@ if [[ -z ${VEGA_RUNTIME_DIR:-} && ! -L "$work/.runtime-link-check" ]] &&
 fi
 mkdir -p "$runtime"
 runtime="$(cd "$runtime" && pwd -P)"
+if [[ "$runtime" != "$work" ]]; then export VEGA_RANGE_ARCHIVES=1; fi
 if [[ ! -L "$runtime/.runtime-link-check" ]] && ! ln -s .runtime-link-target "$runtime/.runtime-link-check"; then
   echo "Set VEGA_RUNTIME_DIR to a writable local Linux directory that supports symlinks." >&2
   exit 1

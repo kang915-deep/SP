@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import tarfile
-from archive_download import download
+from archive_download import ArchiveStream, download, download_pieces
 from hound_archive_manifest import ITEMS
 from vsi_media_archives import VSI_ARCHIVES
 
@@ -33,12 +33,19 @@ def fetch(repo,rev,name,digest,size=None):
     if path==part:
         endpoint=os.environ.get("HF_ENDPOINT","https://huggingface.co").rstrip("/")
         url=f"{endpoint}/datasets/{repo}/resolve/{rev}/{name}"
+        if size is not None and (part.exists() or os.environ.get("VEGA_RANGE_ARCHIVES")=="1"
+                                 or part.with_name(part.name+".ranges").is_dir()):
+            pieces=download_pieces(url,part,size)
+            with ArchiveStream(pieces) as stream:
+                if hashlib.file_digest(stream,"sha256").hexdigest()!=digest:
+                    raise ValueError(f"Archive SHA-256 mismatch before extraction: {name}")
+            return pieces
         download(url,part,size)
     with path.open("rb") as f:
         if hashlib.file_digest(f,"sha256").hexdigest()!=digest:
             raise ValueError(f"Checksum mismatch: {path}")
     if path==part:os.replace(part,target)
-    return target
+    return [target] if size is not None else target
 
 def dataset_digest(rows):
     digest=hashlib.sha256()
@@ -93,7 +100,7 @@ if args.stage!="annotations":
                 resumed[item["name"]] = fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
         for item in items:
             path=resumed.get(item["name"]) or fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
-            with tarfile.open(path,"r|gz") as tar:
+            with ArchiveStream(path) as stream, tarfile.open(fileobj=stream,mode="r|gz") as tar:
                 for member in tar:
                     if not member.isfile():continue
                     rel=PurePosixPath(member.name)

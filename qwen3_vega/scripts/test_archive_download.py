@@ -1,14 +1,59 @@
 """Exercise real curl against a local server that drops the first connection."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import hashlib
+import io
+import random
+import tarfile
 import tempfile
 import threading
 import unittest
 
-from archive_download import download
+from archive_download import ArchiveStream, download, download_pieces
 
 
 class ArchiveDownloadTest(unittest.TestCase):
+    def test_read_only_prefix_and_reusable_ranges(self):
+        member = random.Random(42).randbytes(72000)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            info = tarfile.TarInfo("video.mp4")
+            info.size = len(member)
+            tar.addfile(info, io.BytesIO(member))
+        archive = buf.getvalue()
+        requests = []
+
+        class Server(BaseHTTPRequestHandler):
+            def do_GET(self):
+                first, last = map(int, self.headers["Range"][6:].split("-"))
+                requests.append((first, last))
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{last}/{len(archive)}")
+                self.send_header("Content-Length", str(last-first+1))
+                self.end_headers()
+                stop = first + 200 if len(requests) == 1 else last + 1
+                self.wfile.write(archive[first:stop])
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Server) as server, tempfile.TemporaryDirectory() as folder:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            part = Path(folder) / "video.tar.gz.part"
+            part.write_bytes(archive[:7])
+            part.chmod(0o444)
+            url = f"http://127.0.0.1:{server.server_port}/file"
+            try:
+                paths = download_pieces(url, part, len(archive), 16384)
+                self.assertEqual(requests[0], requests[1])
+                count = len(requests)
+                self.assertEqual(download_pieces(url, part, len(archive), 16384), paths)
+                self.assertEqual(count, len(requests))
+                self.assertEqual(part.read_bytes(), archive[:7])
+                with ArchiveStream(paths) as stream:
+                    self.assertEqual(hashlib.file_digest(stream, "sha256").digest(), hashlib.sha256(archive).digest())
+                with ArchiveStream(paths) as stream, tarfile.open(fileobj=stream, mode="r|gz") as tar:
+                    self.assertEqual(tar.extractfile(tar.next()).read(), member)
+            finally:
+                server.shutdown()
+
     def test_existing_partial_and_interrupted_resume(self):
         payload = bytes(range(256)) * 8192
         offsets = []
