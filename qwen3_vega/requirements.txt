@@ -11,3 +11,4 @@ imageio
 imageio-ffmpeg
 ninja
 sentencepiece
+nvidia-ml-py

@@ -76,7 +76,22 @@ bash qwen3_vega/scripts/train_4gpu.sh \
 nvidia-smi --id="$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,utilization.gpu,memory.used,memory.total --format=csv -l 2
 ```
 
-四卡首次调优可在独立输出目录以 `--stop-after 3` 比较 `--micro-batch 1` 和 `2`，保持有效 batch 64，按稳定步 QA/s 和四卡显存余量选正式配置。两次短测也会保存完整断点，需要预留磁盘。每 250 步默认额外保存模型与 Adam，全程保留可达约 2 TiB。空间有限时可传 `--save-every 4657`，仅保留四个验证点的完整断点。可选 `--cpu-adam` 用主机内存换显存，首次使用需要本机 C++ 编译环境。
+**四卡先测速度。** 在明确分配的四张卡上，用相同训练样本和有效 batch 64 比较下列两次运行。测速模式执行完整前向、反向、通信和 AdamW 更新。第 1 步预热，其后 4 步计时。每组独立生成 `throughput.json`，记录整机 QA/s、各卡 PyTorch 显存峰值，以及每 0.5 秒采样的设备平均利用率和最小剩余显存。设备读数包含同卡的其他进程。测速结束即退出，省去大断点写盘及下游任务。
+
+```bash
+for stride in 1 2; do
+  bash qwen3_vega/scripts/train_4gpu.sh \
+    --qwen "$WORK/assets/qwen" --wan "$WORK/assets/wan" --data "$WORK/data" \
+    --output "$WORK/runs/bench-m1-c$stride" --micro-batch 1 \
+    --checkpoint-every "$stride" --benchmark-steps 5
+done
+```
+
+`--checkpoint-every 1` 在反向传播时重算全部 36 个语言层的中间结果，这是兼容旧实验的默认设置。`2` 只重算隔层，`0` 保留所有语言层的中间结果。这里的参数控制显存，与保存训练断点的间隔无关。如果四卡实测有足够余量，可以再测 `0` 或将训练 micro-batch 调到 2，使用新的输出目录。按 QA/s 以及长样本下最紧张那张卡的余量选正式配置，把获选参数加在第 4 节的训练命令后。验证、存盘和数据准备时间应另外计入整轮用时。
+
+单 A800 80 GB 上的对照使用同两条真实 QA、完整视觉编码、82.33 亿参数前反向，每种配置预热后交错测三次。全层、隔层、关闭重算分别为 0.442、0.454、0.470 QA/s，PyTorch 峰值分别为 39.4、45.2、50.9 GiB。该探测逐条读取媒体，未分配完整 Adam 状态或执行多卡通信。四卡正式吞吐以目标机器的报告为准。
+
+每 250 步默认额外保存模型与 Adam，全程保留可达约 2 TiB。空间有限时可传 `--save-every 4657`，仅保留四个验证点的完整断点。可选 `--cpu-adam` 用主机内存换显存，首次使用需要本机 C++ 编译环境。
 
 意外中断后，选输出目录中最新的 `step-XXXXXX.json`，在原启动命令末尾加上例如 `--resume step-000250`。保持原世界大小、micro-batch、优化器位置和数据。新运行和不同配置使用各自的输出目录。
 

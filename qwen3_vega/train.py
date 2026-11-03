@@ -25,11 +25,16 @@ for name in ("qwen", "wan", "data", "output"):
 parser.add_argument("--resume", help="Committed step tag in the same output directory")
 parser.add_argument("--smoke", action="store_true", help="Real 8B+Wan forward; update final decoder layer and fusion only")
 parser.add_argument("--micro-batch", type=int, default=1)
+parser.add_argument("--checkpoint-every", type=int, choices=(0, 1, 2), default=1,
+                    help="Recompute every decoder layer (1), alternate layers (2), or none (0)")
+parser.add_argument("--benchmark-steps", type=int, help="Measure full optimizer updates in a fresh run, without checkpoint I/O or downstream stages")
 parser.add_argument("--cpu-adam", action="store_true", help="Offload FP32 optimizer states to host RAM (slower, less VRAM)")
 parser.add_argument("--workers", type=int, default=2)
 parser.add_argument("--stop-after", type=int, help="Commit an optimizer checkpoint and exit after this global step")
 parser.add_argument("--save-every", type=int, default=250)
 args = parser.parse_args()
+if args.benchmark_steps is not None and (args.benchmark_steps < 2 or args.resume or args.stop_after):
+    parser.error("Use at least two benchmark steps in a fresh run without --resume or --stop-after")
 rank, world, local = (int(os.environ[k]) for k in ("RANK","WORLD_SIZE","LOCAL_RANK"))
 if args.workers < 0 or args.save_every < 1:
     parser.error('workers must be nonnegative and save-every must be positive')
@@ -51,6 +56,10 @@ if not args.smoke and not (data_dir/"media_ready.json").is_file():
     raise ValueError("Finish the verified media preparation before full training")
 protocol = {"train_sha256":hashlib.sha256(raw).hexdigest(),"tune_sha256":hashlib.sha256((data_dir/"tune.json").read_bytes()).hexdigest(),
             "world":world,"micro_batch":width,"effective_batch":effective_batch,"smoke":args.smoke,"cpu_adam":args.cpu_adam}
+if args.checkpoint_every != 1:
+    protocol["checkpoint_every"] = args.checkpoint_every
+if args.benchmark_steps is not None:
+    protocol["benchmark_steps"] = args.benchmark_steps
 out = args.output.resolve()
 if rank == 0:
     if args.resume:
@@ -69,6 +78,8 @@ enc = FrozenEncoders(qwen.model.visual,wan)
 qwen.model.visual = None
 model = BatchedVega(qwen)
 qwen.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
+for index,layer in enumerate(qwen.model.language_model.layers):
+    layer.gradient_checkpointing = bool(args.checkpoint_every and index % args.checkpoint_every == 0)
 if args.smoke:
     qwen.requires_grad_(False)
     qwen.model.language_model.layers[-1].requires_grad_(True)
@@ -107,6 +118,8 @@ for row in rows+tune:
     row["path"]=str(data_dir/row["path"])
 order=sorted(range(len(rows)),key=lambda i:hashlib.sha256(("train-order-0:"+rows[i]["id"]).encode()).digest())
 total=math.ceil(len(rows)/effective_batch)
+if args.benchmark_steps is not None and args.benchmark_steps > total:
+    raise ValueError("Benchmark exceeds available training steps")
 validation_steps={math.ceil(total*f) for f in (.25,.5,.75,1.)}
 if args.stop_after is not None and not start<args.stop_after<=total:raise ValueError("stop-after outside remaining budget")
 
@@ -140,7 +153,25 @@ for pos in range(start*effective_batch,total*effective_batch,world*width):
         indices.append((order[min(i,len(rows)-1)],i<len(rows)))
 batches=iter(loader(rows,indices,width))
 if rank==0:print("READY",json.dumps(dict(protocol,trainable=sum(p.numel() for _,p in params),start=start)),flush=True)
-for step in range(start,total):
+measured_seconds=[]
+measured_examples=0
+if args.benchmark_steps is not None:
+    import threading
+    import pynvml
+    pynvml.nvmlInit()
+    handle=pynvml.nvmlDeviceGetHandleByUUID("GPU-"+str(torch.cuda.get_device_properties(device).uuid))
+    sampling_done=threading.Event()
+    utilization=[]
+    free_bytes=[]
+    def sample_gpu():
+        while not sampling_done.is_set():
+            utilization.append(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+            free_bytes.append(pynvml.nvmlDeviceGetMemoryInfo(handle).free)
+            sampling_done.wait(.5)
+    monitor=threading.Thread(target=sample_gpu,daemon=True)
+for step in range(start,args.benchmark_steps or total):
+    if args.benchmark_steps is not None and step==1:
+        monitor.start()
     begin=time.perf_counter()
     n=min(effective_batch,len(rows)-step*effective_batch)
     warmup=math.ceil(total*.03)
@@ -161,7 +192,10 @@ for step in range(start,total):
     elapsed=time.perf_counter()-begin
     event={"step":completed,"train_ce":ce.item()/n,"qa_per_s":n/elapsed,"seconds":elapsed,
            "peak_gpu_gib":torch.cuda.max_memory_allocated(device)/2**30,"lr":1e-5*factor}
-    if completed in validation_steps:
+    if args.benchmark_steps is not None and completed > 1:
+        measured_seconds.append(elapsed)
+        measured_examples+=n
+    if args.benchmark_steps is None and completed in validation_steps:
         engine.eval()
         # Match standalone export verification even when training uses padded batches.
         count=math.ceil(len(tune)/world)*world
@@ -181,7 +215,7 @@ for step in range(start,total):
     if rank==0:
         print("STEP",json.dumps(event),flush=True)
         with (out/"metrics.jsonl").open("a") as f:f.write(json.dumps(event)+"\n")
-    if completed in validation_steps or completed % args.save_every==0 or completed==args.stop_after:
+    if args.benchmark_steps is None and (completed in validation_steps or completed % args.save_every==0 or completed==args.stop_after):
         tag=f"step-{completed:06d}"
         engine.save_checkpoint(str(out/"checkpoints"),tag=tag,save_latest=False,exclude_frozen_parameters=args.smoke,
                                client_state={"protocol":protocol,"step":completed,"best":best})
@@ -189,6 +223,21 @@ for step in range(start,total):
         if rank==0:
             with (out/(tag+".json")).open("x") as f:json.dump({"step":completed,"best":best},f)
     if completed==args.stop_after:break
-if completed==total and rank==0:
+if args.benchmark_steps is not None:
+    sampling_done.set()
+    monitor.join()
+    pynvml.nvmlShutdown()
+    local_stats={"rank":rank,"seconds":sum(measured_seconds),"peak_allocated_gib":torch.cuda.max_memory_allocated(device)/2**30,
+                 "peak_reserved_gib":torch.cuda.max_memory_reserved(device)/2**30,
+                 "nvml_samples":len(utilization),"mean_device_util_pct":sum(utilization)/len(utilization),
+                 "min_device_free_gib":min(free_bytes)/2**30}
+    ranks=[None]*world
+    dist.all_gather_object(ranks,local_stats)
+    if rank==0:
+        report={"measured_steps":len(measured_seconds),"warmup_steps":1,"qa":measured_examples,
+                "qa_per_s":measured_examples/max(r["seconds"] for r in ranks),"ranks":ranks,"protocol":protocol}
+        (out/"throughput.json").write_text(json.dumps(report,indent=2))
+        print("BENCHMARK",json.dumps(report),flush=True)
+elif completed==total and rank==0:
     (out/"selected.json").write_text(json.dumps(dict(best,tag=f"step-{best['step']:06d}")))
 dist.destroy_process_group()
