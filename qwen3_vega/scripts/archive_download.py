@@ -37,7 +37,7 @@ class ArchiveStream(io.RawIOBase):
         super().close()
 
 
-def download_pieces(url, part, size, chunk_bytes=128 << 20):
+def download_pieces(url, part, size, chunk_bytes=128 << 20, fallback_url=None):
     """Keep the existing prefix read-only. Every new write starts at byte zero of a new object."""
     offset = part.stat().st_size if part.exists() else 0
     if offset > size:
@@ -66,6 +66,10 @@ def download_pieces(url, part, size, chunk_bytes=128 << 20):
                     break
                 retry = (result.returncode in (5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 92)
                          or result.stdout in ("408", "429", "500", "502", "503", "504"))
+                if fallback_url and (retry or result.stdout in ("401","403","404") or result.returncode in (0,63)):
+                    print(f"Retrying range {start}-{end} from ModelScope", flush=True)
+                    url, fallback_url = fallback_url, None
+                    retry = True
                 if not retry or attempt == 8:
                     raise RuntimeError(f"Range {start}-{end} failed in {tmp}: curl {result.returncode}, "
                                        f"HTTP {result.stdout}. Original data retained.")

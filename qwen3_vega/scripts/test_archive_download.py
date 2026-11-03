@@ -22,11 +22,13 @@ class ArchiveDownloadTest(unittest.TestCase):
             tar.addfile(info, io.BytesIO(member))
         archive = buf.getvalue()
         requests = []
+        routes = []
 
         class Server(BaseHTTPRequestHandler):
             def do_GET(self):
                 first, last = map(int, self.headers["Range"][6:].split("-"))
                 requests.append((first, last))
+                routes.append(self.path.split("?")[0])
                 self.send_response(206)
                 self.send_header("Content-Range", f"bytes {first}-{last}/{len(archive)}")
                 self.send_header("Content-Length", str(last-first+1))
@@ -41,8 +43,9 @@ class ArchiveDownloadTest(unittest.TestCase):
             part.chmod(0o444)
             url = f"http://127.0.0.1:{server.server_port}/file"
             try:
-                paths = download_pieces(url, part, len(archive), 16384)
+                paths = download_pieces(url, part, len(archive), 16384, fallback_url=url+"-mirror")
                 self.assertEqual(requests[0], requests[1])
+                self.assertEqual(routes, ["/file"] + ["/file-mirror"] * (len(routes)-1))
                 count = len(requests)
                 self.assertEqual(download_pieces(url, part, len(archive), 16384), paths)
                 self.assertEqual(count, len(requests))

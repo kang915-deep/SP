@@ -33,9 +33,17 @@ def fetch(repo,rev,name,digest,size=None):
     if path==part:
         endpoint=os.environ.get("HF_ENDPOINT","https://huggingface.co").rstrip("/")
         url=f"{endpoint}/datasets/{repo}/resolve/{rev}/{name}"
-        if size is not None and (part.exists() or os.environ.get("VEGA_RANGE_ARCHIVES")=="1"
+        fallback=None
+        hound=repo=="ShareGPTVideo/train_video_and_instruction"
+        if hound:
+            mirror=f"https://modelscope.cn/datasets/wzywuan/train_video_and_instruction/resolve/dd8f96756c1c2b407adc78673acc96e5ec93f16f/{name}"
+            if os.environ.get("HOUND_SOURCE")=="modelscope":
+                url=mirror
+            else:
+                fallback=mirror
+        if size is not None and (hound or part.exists() or os.environ.get("VEGA_RANGE_ARCHIVES")=="1"
                                  or part.with_name(part.name+".ranges").is_dir()):
-            pieces=download_pieces(url,part,size)
+            pieces=download_pieces(url,part,size,fallback_url=fallback)
             with ArchiveStream(pieces) as stream:
                 if hashlib.file_digest(stream,"sha256").hexdigest()!=digest:
                     raise ValueError(f"Archive SHA-256 mismatch before extraction: {name}")
