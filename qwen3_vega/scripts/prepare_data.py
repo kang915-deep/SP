@@ -7,8 +7,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import subprocess
 import tarfile
+from archive_download import download
 from hound_archive_manifest import ITEMS
 from vsi_media_archives import VSI_ARCHIVES
 
@@ -26,14 +26,14 @@ out.mkdir(exist_ok=True,parents=True)
 archives=(args.archives_dir or out/"downloads").resolve()
 archives.mkdir(exist_ok=True,parents=True)
 
-def fetch(repo,rev,name,digest):
+def fetch(repo,rev,name,digest,size=None):
     target=archives/Path(name).name
     part=target.with_suffix(target.suffix+".part")
     path=target if target.is_file() else part
     if path==part:
         endpoint=os.environ.get("HF_ENDPOINT","https://huggingface.co").rstrip("/")
         url=f"{endpoint}/datasets/{repo}/resolve/{rev}/{name}"
-        subprocess.run(["curl","-fsSL","--retry","4","--connect-timeout","20","-C","-","-o",str(part),url],check=True)
+        download(url,part,size)
     with path.open("rb") as f:
         if hashlib.file_digest(f,"sha256").hexdigest()!=digest:
             raise ValueError(f"Checksum mismatch: {path}")
@@ -86,8 +86,13 @@ if args.stage!="annotations":
             wanted[r["kind"]].add(r["media"] if r["kind"]=="video" else Path(r["media"]).name)
     covered={"video":set(),"frames":set()}
     for kind,items in (("video",VSI_ARCHIVES),("frames",ITEMS)):
+        # Resume the interrupted archive before rechecking earlier multi-GB archives.
+        resumed = {}
         for item in items:
-            path=fetch(item["repo"],item["revision"],item["name"],item["sha256"])
+            if (archives/(Path(item["name"]).name+".part")).is_file():
+                resumed[item["name"]] = fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
+        for item in items:
+            path=resumed.get(item["name"]) or fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
             with tarfile.open(path,"r|gz") as tar:
                 for member in tar:
                     if not member.isfile():continue
@@ -97,6 +102,9 @@ if args.stage!="annotations":
                     key=str(rel) if kind=="video" else rel.parts[0]
                     if key not in wanted[kind]:continue
                     dest=out/"media"/("vsi" if kind=="video" else "hound")/str(rel)
+                    if dest.is_file() and dest.stat().st_size==member.size:
+                        covered[kind].add(key)
+                        continue
                     dest.parent.mkdir(parents=True,exist_ok=True)
                     part=dest.with_suffix(dest.suffix+".part")
                     with tar.extractfile(member) as stream,part.open("wb") as dst:shutil.copyfileobj(stream,dst,4<<20)
