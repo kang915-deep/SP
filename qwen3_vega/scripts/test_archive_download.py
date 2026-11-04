@@ -43,7 +43,7 @@ class ArchiveDownloadTest(unittest.TestCase):
             part.chmod(0o444)
             url = f"http://127.0.0.1:{server.server_port}/file"
             try:
-                paths = download_pieces(url, part, len(archive), 16384, fallback_url=url+"-mirror")
+                paths = download_pieces(url, part, len(archive), 16384, fallback_url=url+"-mirror", workers=1)
                 self.assertEqual(requests[0], requests[1])
                 self.assertEqual(routes, ["/file"] + ["/file-mirror"] * (len(routes)-1))
                 count = len(requests)
@@ -54,6 +54,42 @@ class ArchiveDownloadTest(unittest.TestCase):
                     self.assertEqual(hashlib.file_digest(stream, "sha256").digest(), hashlib.sha256(archive).digest())
                 with ArchiveStream(paths) as stream, tarfile.open(fileobj=stream, mode="r|gz") as tar:
                     self.assertEqual(tar.extractfile(tar.next()).read(), member)
+            finally:
+                server.shutdown()
+
+    def test_parallel_ranges_keep_archive_order(self):
+        import time
+        payload = random.Random(19).randbytes(65536)
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        class Server(BaseHTTPRequestHandler):
+            def do_GET(self):
+                nonlocal active, peak
+                first, last = map(int, self.headers["Range"][6:].split("-"))
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(.15 if first == 0 else .03)
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{last}/{len(payload)}")
+                self.send_header("Content-Length", str(last-first+1))
+                self.end_headers()
+                self.wfile.write(payload[first:last+1])
+                with lock:
+                    active -= 1
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Server) as server, tempfile.TemporaryDirectory() as folder:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            part = Path(folder) / "archive.part"
+            url = f"http://127.0.0.1:{server.server_port}/archive"
+            try:
+                paths = download_pieces(url, part, len(payload), 16384, workers=4)
+                self.assertGreaterEqual(peak, 2)
+                with ArchiveStream(paths) as stream:
+                    self.assertEqual(hashlib.file_digest(stream,"sha256").digest(), hashlib.sha256(payload).digest())
+                self.assertEqual(paths, sorted(paths, key=lambda p: int(p.name.split('-')[0])))
             finally:
                 server.shutdown()
 

@@ -28,6 +28,16 @@ bash start.sh /mnt/data 0,1,2,3
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。
 
+分块下载默认 **4 路网络并发**，写入数据盘保持单路，最多暂存约 512 MiB，避免对象存储追加写入问题。可用 `VEGA_DOWNLOAD_WORKERS=1` 降低并发，最大支持 8。日志分别显示 `network`（网络）、`write`（写盘）、`read/hash`（整包读取校验）和 `extract_seconds`（解压），`Writing new range` 表示该块已从网络收到、准备写盘，并不表示仍在网络下载。
+
+已经启动旧下载器时，`git pull` 不会更新运行中的 Python。要保留已有分块并切换到新版，只需执行（数据盘和四张卡沿用原参数）：
+
+```bash
+git pull --ff-only && python3 qwen3_vega/scripts/resume_download.py /数据盘 0,1,2,3
+```
+
+此命令仅重启本仓库、该数据目录中正在执行数据准备的启动器，默认使用 ModelScope 和 4 路下载。若已进入训练或评测，会拒绝停止。它不删除已有分块、不终止其他任务，也不自动等待 GPU。
+
 这份代码用 Qwen3-VL-8B-Instruct 替换 VEGA 的语言视觉底座。视频均匀采样为 4–8 帧，冻结的 Qwen 视觉塔和 Wan2.1-T2V-1.3B 分别编码同一帧。Wan 特征经 patch merger 对齐图像 token，再通过 VEGA 的逐 token 门控残差融合进入 Qwen3。Qwen3 自带的 DeepStack 分支保留。正式训练更新语言模型、输出头和新建的融合层，用助手答案 token 的交叉熵监督，每条 QA 等权。
 
 ## 1. 准备环境和权重

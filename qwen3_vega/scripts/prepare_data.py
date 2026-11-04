@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import tarfile
+import time
 from archive_download import ArchiveStream, download, download_pieces
 from hound_archive_manifest import ITEMS
 from vsi_media_archives import VSI_ARCHIVES
@@ -44,9 +45,13 @@ def fetch(repo,rev,name,digest,size=None):
         if size is not None and (hound or part.exists() or os.environ.get("VEGA_RANGE_ARCHIVES")=="1"
                                  or part.with_name(part.name+".ranges").is_dir()):
             pieces=download_pieces(url,part,size,fallback_url=fallback)
+            started=time.monotonic()
+            print(f"Verifying archive SHA-256: {name} ({size/2**30:.2f} GiB)",flush=True)
             with ArchiveStream(pieces) as stream:
                 if hashlib.file_digest(stream,"sha256").hexdigest()!=digest:
                     raise ValueError(f"Archive SHA-256 mismatch before extraction: {name}")
+            print(f"Verified {name}: read/hash {time.monotonic()-started:.1f}s, "
+                  f"{size/2**20/(time.monotonic()-started):.2f} MiB/s",flush=True)
             return pieces
         download(url,part,size)
     with path.open("rb") as f:
@@ -108,6 +113,8 @@ if args.stage!="annotations":
                 resumed[item["name"]] = fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
         for item in items:
             path=resumed.get(item["name"]) or fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
+            extract_started=time.monotonic()
+            print("Extracting selected media:",item["name"],flush=True)
             with ArchiveStream(path) as stream, tarfile.open(fileobj=stream,mode="r|gz") as tar:
                 for member in tar:
                     if not member.isfile():continue
@@ -125,6 +132,6 @@ if args.stage!="annotations":
                     with tar.extractfile(member) as stream,part.open("wb") as dst:shutil.copyfileobj(stream,dst,4<<20)
                     if part.stat().st_size!=member.size:raise IOError(f"Incomplete {dest}")
                     os.replace(part,dest);covered[kind].add(key)
-            print("Verified and extracted",item["name"],flush=True)
+            print("Verified and extracted",item["name"],f"extract_seconds={time.monotonic()-extract_started:.1f}",flush=True)
     if covered!=wanted:raise ValueError({k:len(wanted[k]-covered[k]) for k in wanted})
     (out/"media_ready.json").write_text(json.dumps({k:len(v) for k,v in covered.items()}))
