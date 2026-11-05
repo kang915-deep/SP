@@ -8,7 +8,7 @@ clone 后进入仓库根目录，把下面两个参数换成**已挂载、可写
 bash start.sh /mnt/data 0,1,2,3
 ```
 
-命令返回后台 PID 和可直接复制的 `tail -f` 命令。训练数据、模型权重、断点和日志保存在指定数据盘的 `qwen3-vega/` 下。默认也在这里安装软件。如果挂载盘不支持符号链接（例如部分 BOS 挂载），脚本会把 Python 环境、依赖缓存和编译临时文件放到当前用户的本地缓存目录，并在日志的 `Software runtime` 一行打印位置。也可以在启动命令前设置 `VEGA_RUNTIME_DIR=/本地盘上的专用目录`，选择空间足够且支持符号链接的 Linux 文件系统。
+命令返回后台 PID 和可直接复制的 `tail -f` 命令。训练数据、模型权重、断点保存在指定数据盘的 `qwen3-vega/` 下。**新启动日志默认放在当前用户的本地缓存盘**，避免 BOS 挂载上 `tail: Bad file descriptor`；数据盘 `logs/*.location.txt` 保存日志路径，旧日志保留。可设置 `VEGA_LOG_DIR=/本地日志目录`。默认在数据盘安装软件；如果挂载盘不支持符号链接，脚本会把 Python 环境、依赖缓存和编译临时文件放到本地缓存目录，并打印 `Software runtime`。也可以设置 `VEGA_RUNTIME_DIR=/本地盘上的专用目录`。
 
 服务器需要 Linux、可用的 NVIDIA 驱动和 CUDA 构建环境、Python 3 与 pip，以及 git、curl、flock，并能访问 GitHub、软件源和数据源。训练媒体压缩包约 290 GiB，还要存解压媒体、权重、特征缓存和四份完整模型/Adam 断点，建议为整套工作预留 **约 1.5 TiB**。
 
@@ -28,15 +28,17 @@ bash start.sh /mnt/data 0,1,2,3
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。
 
-分块下载默认 **4 路网络并发**，写入数据盘保持单路，最多暂存约 512 MiB，避免对象存储追加写入问题。可用 `VEGA_DOWNLOAD_WORKERS=1` 降低并发，最大支持 8。日志分别显示 `network`（网络）、`write`（写盘）、`read/hash`（整包读取校验）和 `extract_seconds`（解压），`Writing new range` 表示该块已从网络收到、准备写盘，并不表示仍在网络下载。
+普通启动默认 **4 路网络并发**，恢复命令默认 **8 路**，写入数据盘保持单路。8 路运行时为本地临时目录留至少 2 GiB。可用 `VEGA_DOWNLOAD_WORKERS` 设置普通启动的并发，或给恢复命令加 `--workers 4`。连接中断会保留当前分块在本地已收到的字节，从该字节继续，明确打印 `RETRY`，最多 8 次。完整包仍须通过 SHA-256 校验。日志分别显示网络、写盘、校验和解压耗时，速度取决于实际网络和存储。
+
+恢复时优先处理尚未完成的 `.part` **或 `.part.ranges` 包**，再处理未开始的包，最后检查已下载的包。新版完成解压会保存覆盖清单，下次启动检查清单及媒体大小后可直接复用，避免重新扫描整包。旧版没有解压清单的包仍需要一次校验和扫描，不能仅凭目录存在就当作完整。
 
 已经启动旧下载器时，`git pull` 不会更新运行中的 Python。要保留已有分块并切换到新版，只需执行（数据盘和四张卡沿用原参数）：
 
 ```bash
-git pull --ff-only && python3 qwen3_vega/scripts/resume_download.py /数据盘 0,1,2,3
+git pull --ff-only && python3 qwen3_vega/scripts/resume_download.py /数据盘 0,1,2,3 --workers 8
 ```
 
-此命令仅重启本仓库、该数据目录中正在执行数据准备的启动器，默认使用 ModelScope 和 4 路下载。若已进入训练或评测，会拒绝停止。它不删除已有分块、不终止其他任务，也不自动等待 GPU。
+此命令仅重启本仓库、该数据目录中正在执行数据准备的启动器，默认使用 ModelScope 和 8 路下载。已退出则直接接续，若已进入训练或评测会拒绝停止。它不删除已有分块、不终止其他任务，也不自动等待 GPU。更新代码后必须执行恢复命令，正在运行的旧 Python 不会因 `git pull` 自动升级。
 
 这份代码用 Qwen3-VL-8B-Instruct 替换 VEGA 的语言视觉底座。视频均匀采样为 4–8 帧，冻结的 Qwen 视觉塔和 Wan2.1-T2V-1.3B 分别编码同一帧。Wan 特征经 patch merger 对齐图像 token，再通过 VEGA 的逐 token 门控残差融合进入 Qwen3。Qwen3 自带的 DeepStack 分支保留。正式训练更新语言模型、输出头和新建的融合层，用助手答案 token 的交叉熵监督，每条 QA 等权。
 

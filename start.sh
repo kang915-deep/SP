@@ -25,11 +25,18 @@ if [[ ${1:-} != --worker ]]; then
   flock -n 9 || { echo "A launcher is already active in $work" >&2; exit 1; }
   if [[ -s "$work/results.json" ]]; then echo "Already complete: $work/results.json"; exit 0; fi
   gpu_list="$(IFS=,; echo "${uuids[*]}")"
-  log="$(mktemp "$work/logs/launch-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")"
+  # Keep live stdout on local storage. BOS/FUSE may reject tail/read on an open object.
+  key="$(printf '%s' "$work" | sha256sum | cut -c1-16)"
+  logdir="${VEGA_LOG_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/qwen3-vega/$key/logs}"
+  mkdir -p "$logdir"
+  logdir="$(cd "$logdir" && pwd)"
+  log="$(mktemp "$logdir/launch-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")"
+  printf '%s\n' "$log" > "$work/logs/$(basename "$log").location.txt"
   nohup bash "$repo/start.sh" --worker "$work" "$gpu_list" 9>&9 >"$log" 2>&1 </dev/null &
   echo "Started PID $! on GPUs $ids"
   printf 'Follow: tail -f %q\n' "$log"
   echo "Results: $work/results.json"
+  echo "Live log is on local storage; data and checkpoints remain in $work"
   exit 0
 fi
 

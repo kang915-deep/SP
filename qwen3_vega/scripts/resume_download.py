@@ -41,7 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('data_disk', type=Path)
     parser.add_argument('gpus', help='The same four GPUs passed to start.sh')
-    parser.add_argument('--workers', type=int, default=4, choices=range(1,9))
+    parser.add_argument('--workers', type=int, default=8, choices=range(1,9))
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
@@ -99,7 +99,7 @@ def main():
     elif args.dry_run:
         print('No matching launcher; would start the existing workspace.')
         return
-    env = dict(os.environ, HOUND_SOURCE='modelscope', VEGA_DOWNLOAD_WORKERS=str(args.workers))
+    env = dict(os.environ, HOUND_SOURCE='modelscope', VEGA_DOWNLOAD_WORKERS=str(args.workers), VEGA_RANGE_ARCHIVES='1')
     subprocess.run(['bash', entry, str(args.data_disk.resolve()), args.gpus], env=env, check=True, cwd=repo)
 
 

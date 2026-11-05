@@ -79,17 +79,28 @@ def download_pieces(url, part, size, chunk_bytes=128 << 20, fallback_url=None, w
             scratch = Path(tmp) / "chunk"
             network_started = time.monotonic()
             for attempt in range(1, 9):
+                received = scratch.stat().st_size if scratch.exists() else 0
+                remaining = length-received
+                response = Path(tmp) / f"response-{attempt}"
                 result = subprocess.run(
                     ["curl", "--http1.1", "-fsSL", "--connect-timeout", "20",
-                     "--speed-limit", "16384", "--speed-time", "90", "--max-time", "1800",
-                     "--max-filesize", str(length),
-                     "--range", f"{start}-{end}", "-o", str(scratch), "-w", "%{http_code}",
-                     f"{source}?download=true&range={start}-{end}-{time.time_ns()}"],
-                    stdout=subprocess.PIPE, text=True)
-                if result.returncode == 0 and result.stdout == "206" and scratch.stat().st_size == length:
-                    break
+                     "--speed-limit", "65536", "--speed-time", "60", "--max-time", "600",
+                     "--max-filesize", str(remaining),
+                     "--range", f"{start+received}-{end}", "-o", str(response), "-w", "%{http_code}",
+                     f"{source}?download=true&range={start+received}-{end}-{time.time_ns()}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 retry = (result.returncode in (5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 92)
                          or result.stdout in ("408", "429", "500", "502", "503", "504"))
+                amount = response.stat().st_size if response.exists() else 0
+                # Resume a dropped HTTP 206 inside the local scratch file, never append to BOS.
+                progress = result.stdout == "206" and 0 < amount <= remaining and (retry or result.returncode == 0)
+                if progress:
+                    with response.open("rb") as src, scratch.open("ab") as dst:
+                        shutil.copyfileobj(src, dst, 4 << 20)
+                    received += amount
+                if received == length:
+                    break
+                retry = retry or (progress and result.returncode == 0)
                 if alternative and (retry or result.stdout in ("401","403","404") or result.returncode in (0,63)):
                     print(f"Retrying range {start}-{end} from ModelScope", flush=True)
                     with source_lock:
@@ -98,8 +109,11 @@ def download_pieces(url, part, size, chunk_bytes=128 << 20, fallback_url=None, w
                     retry = True
                 if not retry or attempt == 8:
                     raise RuntimeError(f"Range {start}-{end} failed in {tmp}: curl {result.returncode}, "
-                                       f"HTTP {result.stdout}. Original data retained.")
-                time.sleep(min(2 ** attempt, 30))
+                                       f"HTTP {result.stdout}. Original data retained. {result.stderr.strip()[-500:]}")
+                print(f"RETRY {attempt}/8: range {start}-{end}, curl={result.returncode}, "
+                      f"HTTP={result.stdout}, retained {received}/{length} bytes locally; "
+                      f"continuing at {start+received}", flush=True)
+                time.sleep(1 if progress else min(2 ** attempt, 30))
             network_seconds = time.monotonic()-network_started
             with writer:
                 stage = folder / f"{path.name}.{uuid4().hex}.partial"

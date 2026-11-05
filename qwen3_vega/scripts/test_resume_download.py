@@ -11,6 +11,26 @@ import unittest
 
 @unittest.skipUnless(sys.platform == 'linux', 'Linux /proc and signals required')
 class ResumeTests(unittest.TestCase):
+    def test_start_keeps_live_log_on_local_cache(self):
+        with tempfile.TemporaryDirectory(prefix='vega-log-test-') as tmp:
+            root=Path(tmp);disk=root/'object disk';disk.mkdir();bins=root/'bin';bins.mkdir()
+            entry=root/'start.sh'
+            shutil.copyfile(Path(__file__).resolve().parents[2]/'start.sh',entry)
+            # Fake only GPU discovery and the heavyweight worker, run the real public launcher.
+            gpu=bins/'nvidia-smi';gpu.write_text('#!/bin/sh\nprintf "GPU-%s\\n" "$2"\n');gpu.chmod(0o755)
+            worker=bins/'bash';worker.write_text('#!/bin/sh\necho test_worker_started\n');worker.chmod(0o755)
+            env=dict(os.environ,PATH=str(bins)+':'+os.environ['PATH'],XDG_CACHE_HOME=str(root/'local cache'))
+            env.pop('VEGA_LOG_DIR',None)
+            result=subprocess.run(['/bin/bash',str(entry),str(disk),'0,1,2,3'],env=env,capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            location=list((disk/'qwen3-vega/logs').glob('*.location.txt'))
+            self.assertEqual(len(location),1)
+            log=Path(location[0].read_text().strip())
+            self.assertTrue(log.is_relative_to(root/'local cache'))
+            deadline=time.monotonic()+3
+            while 'test_worker_started' not in log.read_text() and time.monotonic()<deadline:time.sleep(.05)
+            self.assertIn('test_worker_started',log.read_text())
+
     def run_case(self, stage):
         with tempfile.TemporaryDirectory(prefix='vega-resume-test-') as tmp:
             repo = Path(tmp)

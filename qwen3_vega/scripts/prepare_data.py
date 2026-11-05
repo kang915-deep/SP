@@ -12,6 +12,7 @@ import time
 from archive_download import ArchiveStream, download, download_pieces
 from hound_archive_manifest import ITEMS
 from vsi_media_archives import VSI_ARCHIVES
+from media_resume import archive_priority, restored_coverage
 
 HERE = Path(__file__).resolve().parent
 SPLITS = ("train","tune","confirm")
@@ -105,33 +106,47 @@ if args.stage!="annotations":
         for r in json.loads((out/(split+".json")).read_text()):
             wanted[r["kind"]].add(r["media"] if r["kind"]=="video" else Path(r["media"]).name)
     covered={"video":set(),"frames":set()}
-    for kind,items in (("video",VSI_ARCHIVES),("frames",ITEMS)):
-        # Resume the interrupted archive before rechecking earlier multi-GB archives.
-        resumed = {}
-        for item in items:
-            if (archives/(Path(item["name"]).name+".part")).is_file():
-                resumed[item["name"]] = fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
-        for item in items:
-            path=resumed.get(item["name"]) or fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
-            extract_started=time.monotonic()
-            print("Extracting selected media:",item["name"],flush=True)
-            with ArchiveStream(path) as stream, tarfile.open(fileobj=stream,mode="r|gz") as tar:
-                for member in tar:
-                    if not member.isfile():continue
-                    rel=PurePosixPath(member.name)
-                    if rel.is_absolute() or ".." in rel.parts:raise ValueError(member.name)
-                    if kind=="frames" and (len(rel.parts)!=2 or rel.suffix.lower() not in (".jpg",".jpeg",".png")):continue
-                    key=str(rel) if kind=="video" else rel.parts[0]
-                    if key not in wanted[kind]:continue
-                    dest=out/"media"/("vsi" if kind=="video" else "hound")/str(rel)
-                    if dest.is_file() and dest.stat().st_size==member.size:
-                        covered[kind].add(key)
-                        continue
-                    dest.parent.mkdir(parents=True,exist_ok=True)
-                    part=dest.with_suffix(dest.suffix+".part")
-                    with tar.extractfile(member) as stream,part.open("wb") as dst:shutil.copyfileobj(stream,dst,4<<20)
-                    if part.stat().st_size!=member.size:raise IOError(f"Incomplete {dest}")
-                    os.replace(part,dest);covered[kind].add(key)
-            print("Verified and extracted",item["name"],f"extract_seconds={time.monotonic()-extract_started:.1f}",flush=True)
+    receipts=out/"archive_receipts"
+    receipts.mkdir(exist_ok=True)
+    selections={k:hashlib.sha256(json.dumps(sorted(v)).encode()).hexdigest() for k,v in wanted.items()}
+    jobs=[(kind,item) for kind,items in (("video",VSI_ARCHIVES),("frames",ITEMS)) for item in items]
+    # A ranges-only Hound interruption comes before old complete VSI or Hound archives.
+    jobs.sort(key=lambda job:archive_priority(job[1],archives))
+    for kind,item in jobs:
+        base=out/"media"/("vsi" if kind=="video" else "hound")
+        identity={"archive_sha256":item['sha256'],"selection_sha256":selections[kind]}
+        receipt=receipts/(Path(item['name']).name+'.json')
+        previous=restored_coverage(receipt,base,identity)
+        if previous is not None:
+            covered[kind].update(previous)
+            print("Reused verified extraction:",item['name'],flush=True)
+            continue
+        path=fetch(item["repo"],item["revision"],item["name"],item["sha256"],item["bytes"])
+        extracted=[];archive_covered=set()
+        extract_started=time.monotonic()
+        print("Extracting selected media:",item["name"],flush=True)
+        with ArchiveStream(path) as stream, tarfile.open(fileobj=stream,mode="r|gz") as tar:
+            for member in tar:
+                if not member.isfile():continue
+                rel=PurePosixPath(member.name)
+                if rel.is_absolute() or ".." in rel.parts:raise ValueError(member.name)
+                if kind=="frames" and (len(rel.parts)!=2 or rel.suffix.lower() not in (".jpg",".jpeg",".png")):continue
+                key=str(rel) if kind=="video" else rel.parts[0]
+                if key not in wanted[kind]:continue
+                dest=out/"media"/("vsi" if kind=="video" else "hound")/str(rel)
+                extracted.append([str(rel),member.size]);archive_covered.add(key)
+                if dest.is_file() and dest.stat().st_size==member.size:
+                    covered[kind].add(key)
+                    continue
+                dest.parent.mkdir(parents=True,exist_ok=True)
+                part=dest.with_suffix(dest.suffix+".part")
+                with tar.extractfile(member) as stream,part.open("wb") as dst:shutil.copyfileobj(stream,dst,4<<20)
+                if part.stat().st_size!=member.size:raise IOError(f"Incomplete {dest}")
+                os.replace(part,dest);covered[kind].add(key)
+        # Written only after full archive SHA-256 and a complete extraction scan.
+        temp=receipt.with_suffix('.json.part')
+        temp.write_text(json.dumps(dict(identity=identity,files=extracted,covered=sorted(archive_covered))))
+        os.replace(temp,receipt)
+        print("Verified and extracted",item["name"],f"extract_seconds={time.monotonic()-extract_started:.1f}",flush=True)
     if covered!=wanted:raise ValueError({k:len(wanted[k]-covered[k]) for k in wanted})
     (out/"media_ready.json").write_text(json.dumps({k:len(v) for k,v in covered.items()}))
