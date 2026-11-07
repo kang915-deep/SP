@@ -49,18 +49,39 @@ def benchmark(work, inputs):
             if rc:
                 message = log.read_text(errors="replace")
                 if not CUDA_OOM.search(message):
-                    lines = message.splitlines()
-                    wrappers = [i for i, line in enumerate(lines) if "ChildFailedError" in line]
-                    end = wrappers[-1] if wrappers else len(lines)
-                    errors = [i for i, line in enumerate(lines[:end]) if re.match(
-                        r"^\s*(?:\[rank\d+\]:\s*)?[\w.]*(?:Error|Exception)\s*:", line)]
-                    if errors:
-                        ranked = [i for i in errors if re.match(r"^\s*\[rank\d+\]:", lines[i])]
-                        index = ranked[-1] if ranked else errors[-1]
-                        summary = "\n".join(lines[max(0, index - 14):index + 5])
-                    else:
-                        summary = message[-3000:]
-                    raise RuntimeError(f"Benchmark failed ({log}):\n{summary}")
+                    failures = [(f"Benchmark failed ({log})", message)]
+                    if "FloatingPointError: Nonfinite" in message:
+                        diagnostic_log = sweep / f"{name}-numerics.log"
+                        diagnostic_cmd = cmd.copy()
+                        diagnostic_cmd[cmd.index("--output") + 1] = str(sweep / f"{name}-numerics")
+                        failed_step = re.search(r"FloatingPointError: Nonfinite[^\n]*?\bstep\s+(\d+)", message)
+                        steps = max(2, min(5, int(failed_step[1]))) if failed_step else 5
+                        diagnostic_cmd[cmd.index("--benchmark-steps") + 1] = str(steps)
+                        diagnostic_cmd.append("--diagnose-numerics")
+                        print(f"Numerical failure; one diagnostic replay: {diagnostic_log}", flush=True)
+                        with diagnostic_log.open("w") as stream:
+                            diagnostic_rc = subprocess.run(
+                                diagnostic_cmd, stdout=stream, stderr=subprocess.STDOUT
+                            ).returncode
+                        failures.append((
+                            f"Diagnostic replay ({diagnostic_log}), exit {diagnostic_rc}; training remains stopped",
+                            diagnostic_log.read_text(errors="replace"),
+                        ))
+                    summaries = []
+                    for heading, content in failures:
+                        lines = content.splitlines()
+                        wrappers = [i for i, line in enumerate(lines) if "ChildFailedError" in line]
+                        end = wrappers[-1] if wrappers else len(lines)
+                        errors = [i for i, line in enumerate(lines[:end]) if re.match(
+                            r"^\s*(?:\[rank\d+\]:\s*)?[\w.]*(?:Error|Exception)\s*:", line)]
+                        if errors:
+                            ranked = [i for i in errors if re.match(r"^\s*\[rank\d+\]:", lines[i])]
+                            index = ranked[-1] if ranked else errors[-1]
+                            summary = "\n".join(lines[max(0, index - 14):index + 5])
+                        else:
+                            summary = content[-3000:]
+                        summaries.append(f"{heading}:\n{summary}")
+                    raise RuntimeError("\n\n".join(summaries))
                 trial["status"] = "cuda_oom"
             else:
                 report = json.loads((out / "throughput.json").read_text())

@@ -20,6 +20,8 @@ class OneClickTest(unittest.TestCase):
         self.calls = []
         self.fatal = False
         self.failure_message = None
+        self.diagnostic_message = "Diagnostic replay completed successfully"
+        self.diagnostic_rc = 0
         self.interrupt = False
         self.env = patch.dict(
             os.environ, CUDA_VISIBLE_DEVICES="a,b,c,d", VSI_BENCH_DIR=str(self.work / "vsi")
@@ -38,7 +40,11 @@ class OneClickTest(unittest.TestCase):
 
         if "--benchmark-steps" in cmd:
             width, stride = int(arg("--micro-batch")), int(arg("--checkpoint-every"))
-            if self.failure_message is not None:
+            if "--diagnose-numerics" in cmd:
+                print(self.diagnostic_message, file=opts["stdout"])
+                if self.diagnostic_rc:
+                    return subprocess.CompletedProcess(cmd, self.diagnostic_rc)
+            elif self.failure_message is not None:
                 opts["stdout"].write(self.failure_message)
                 return subprocess.CompletedProcess(cmd, 1)
             if self.fatal or (width, stride) == (2, 0):
@@ -79,6 +85,7 @@ class OneClickTest(unittest.TestCase):
             (choice["winner"]["micro_batch"], choice["winner"]["checkpoint_every"]), (2, 1)
         )
         self.assertEqual([t["status"] for t in choice["trials"]][-2:], ["low_headroom", "cuda_oom"])
+        self.assertFalse(any("--diagnose-numerics" in cmd for cmd in self.calls))
         self.assertTrue(any("--sp-text" in cmd for cmd in self.calls))
         self.interrupt = False
         self.calls.clear()
@@ -104,6 +111,65 @@ class OneClickTest(unittest.TestCase):
         self.fatal = True
         with self.assertRaisesRegex(RuntimeError, "bad data"):
             one_click.launch(self.work)
+        self.assertFalse((self.work / "speed_selection.json").exists())
+        self.assertEqual(sum("--benchmark-steps" in cmd for cmd in self.calls), 1)
+        self.assertFalse(any("--diagnose-numerics" in cmd for cmd in self.calls))
+
+    def test_nonfinite_gets_one_replay_even_when_replay_succeeds(self):
+        for suffix, expected_steps in [("at step 2", 2), ("at step 1", 2), ("before optimizer update", 5)]:
+            with self.subTest(suffix=suffix):
+                self.calls.clear()
+                self.failure_message = f"[rank2]: FloatingPointError: Nonfinite loss {suffix}\n"
+                with self.assertRaisesRegex(RuntimeError, "training remains stopped") as caught:
+                    one_click.launch(self.work)
+                commands = [cmd for cmd in self.calls if "--benchmark-steps" in cmd]
+                self.assertEqual(len(commands), 2)
+                original, diagnostic = commands
+                expected = original.copy()
+                expected[expected.index("--output") + 1] += "-numerics"
+                expected[expected.index("--benchmark-steps") + 1] = str(expected_steps)
+                expected.append("--diagnose-numerics")
+                self.assertEqual(diagnostic, expected)
+                original_out = Path(original[original.index("--output") + 1])
+                self.assertIn(str(original_out.with_suffix(".log")), str(caught.exception))
+                self.assertIn(str(original_out.with_name(original_out.name + "-numerics.log")), str(caught.exception))
+                self.assertIn(self.failure_message.strip(), str(caught.exception))
+                self.assertIn(self.diagnostic_message, str(caught.exception))
+                self.assertFalse((self.work / "speed_selection.json").exists())
+                self.assertEqual(list((self.work / "runs").glob("full-*")), [])
+
+    def test_nonfinite_replay_error_is_preserved_without_repeating(self):
+        self.failure_message = "[rank0]: FloatingPointError: Nonfinite gradient at step 2\n"
+        self.diagnostic_message = "\n".join([
+            "[rank0]: Traceback (most recent call last):",
+            "[rank0]: backward source context",
+            "[rank0]: RuntimeError: Function 'AttentionBackward' returned nan values in its 0th output.",
+            *("NCCL shutdown" for _ in range(300)),
+            "torch.distributed.elastic.multiprocessing.errors.ChildFailedError:",
+        ])
+        self.diagnostic_rc = 1
+        with self.assertRaises(RuntimeError) as caught:
+            one_click.launch(self.work)
+        self.assertIn(self.failure_message.strip(), str(caught.exception))
+        self.assertIn("backward source context", str(caught.exception))
+        self.assertIn("Function 'AttentionBackward' returned nan", str(caught.exception))
+        self.assertNotIn("ChildFailedError", str(caught.exception))
+        commands = [cmd for cmd in self.calls if "--benchmark-steps" in cmd]
+        self.assertEqual(len(commands), 2)
+        logs = list((self.work / "logs").glob("sweep-*/m1-c1-numerics.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].read_text(), self.diagnostic_message + "\n")
+        self.assertFalse((self.work / "speed_selection.json").exists())
+
+    def test_nonfinite_diagnostic_still_stops_after_one_replay(self):
+        self.failure_message = "[rank0]: FloatingPointError: Nonfinite loss at step 2\n"
+        self.diagnostic_message = "[rank1]: FloatingPointError: Nonfinite gradient at step 1, group=0"
+        self.diagnostic_rc = 1
+        with self.assertRaises(RuntimeError) as caught:
+            one_click.launch(self.work)
+        self.assertIn(self.diagnostic_message, str(caught.exception))
+        self.assertEqual(sum("--benchmark-steps" in cmd for cmd in self.calls), 2)
+        self.assertEqual(sum("--diagnose-numerics" in cmd for cmd in self.calls), 1)
         self.assertFalse((self.work / "speed_selection.json").exists())
 
     def test_uuid_error_survives_nccl_cleanup_and_torchrun_wrapper(self):

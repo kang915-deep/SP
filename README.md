@@ -26,6 +26,8 @@ bash start.sh /mnt/data 0,1,2,3
 
 若旧版测速报 `ValueError: invalid literal for int() ... 'GPU-...'`，先 `git pull --ff-only`，再用原数据盘和四张卡重跑 `bash start.sh`。这是 DeepSpeed 0.18.9 查询显存时不兼容 UUID 的问题；新版在每个训练进程中改用 CUDA 的实际空闲显存查询，保留 UUID 选卡和训练设置，复用已准备的数据与权重。失败的测速日志保留，新测速写入新目录。
 
+若报 `FloatingPointError: Nonfinite ...`，表示训练计算出现 NaN 或 Inf。新版在反向前检查每题 Loss，在实际 Adam 更新前检查梯度、更新后检查参数，并把题目 ID、rank、微步和异常数值写入该次输出目录的 `numerics-rankN.json`，同时打印到日志。测速遇到此错误会在独立 `*-numerics` 目录自动重放一次，开启反向运算追踪及冻结特征/融合/语言输出检查。重放后停止，保留两份日志；重放耗时不会用于测速选优。更新代码后仍用原 `start.sh` 命令，已完成的数据和权重会复用。此功能用于定位异常来源，不会跳过样本、降低学习率或用 NaN 替换值继续训练；并不代表所有非有限数值的成因已经修复。
+
 若训练媒体在对象存储上下载中断，请保留 `.part` 和同名的 `.part.ranges/` 目录。重跑时会只读已有前缀，将剩余数据按最多 128 MiB 一块下载到运行时临时目录，再将每块写成数据盘上的独立文件。脚本在解压前校验整包 SHA-256，无需手动拼接。日志中的 `Range download` 显示已有前缀大小，`Writing new range` 显示正在保存的字节区间。
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。

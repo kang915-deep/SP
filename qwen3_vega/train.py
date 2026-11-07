@@ -18,6 +18,7 @@ from data import prepare, sample_seed
 from train_model import FrozenEncoders
 from model_buffers import snapshot_buffers, restore_buffers
 from wan_sdpa import configure_attention
+from numerics import NumericalChecks
 
 parser = argparse.ArgumentParser()
 for name in ("qwen", "wan", "data", "output"):
@@ -28,6 +29,7 @@ parser.add_argument("--micro-batch", type=int, default=1)
 parser.add_argument("--checkpoint-every", type=int, choices=(0, 1, 2), default=1,
                     help="Recompute every decoder layer (1), alternate layers (2), or none (0)")
 parser.add_argument("--benchmark-steps", type=int, help="Measure full optimizer updates in a fresh run, without checkpoint I/O or downstream stages")
+parser.add_argument("--diagnose-numerics", action="store_true", help="Trace nonfinite operations in a separate benchmark replay; never use its timing for configuration selection")
 parser.add_argument("--cpu-adam", action="store_true", help="Offload FP32 optimizer states to host RAM (slower, less VRAM)")
 parser.add_argument("--workers", type=int, default=2)
 parser.add_argument("--stop-after", type=int, help="Commit an optimizer checkpoint and exit after this global step")
@@ -35,6 +37,8 @@ parser.add_argument("--save-every", type=int, default=250)
 args = parser.parse_args()
 if args.benchmark_steps is not None and (args.benchmark_steps < 2 or args.resume or args.stop_after):
     parser.error("Use at least two benchmark steps in a fresh run without --resume or --stop-after")
+if args.diagnose_numerics and args.benchmark_steps is None:
+    parser.error("Numerical tracing requires a fresh --benchmark-steps run")
 rank, world, local = (int(os.environ[k]) for k in ("RANK","WORLD_SIZE","LOCAL_RANK"))
 if args.workers < 0 or args.save_every < 1:
     parser.error('workers must be nonnegative and save-every must be positive')
@@ -65,6 +69,8 @@ if args.checkpoint_every != 1:
     protocol["checkpoint_every"] = args.checkpoint_every
 if args.benchmark_steps is not None:
     protocol["benchmark_steps"] = args.benchmark_steps
+if args.diagnose_numerics:
+    protocol["diagnose_numerics"] = True
 out = args.output.resolve()
 if rank == 0:
     if args.resume:
@@ -75,6 +81,9 @@ if rank == 0:
         out.mkdir(parents=True,exist_ok=False)
         (out/"protocol.json").write_text(json.dumps(protocol))
 dist.barrier()
+checks = NumericalChecks(out, rank)
+if args.diagnose_numerics:
+    torch.autograd.set_detect_anomaly(True, check_nan=True)
 processor = AutoProcessor.from_pretrained(args.qwen,local_files_only=True)
 qwen = Qwen3VLForConditionalGeneration.from_pretrained(args.qwen,dtype=torch.bfloat16,attn_implementation="sdpa",local_files_only=True)
 configure_attention()
@@ -110,7 +119,19 @@ if args.cpu_adam:
 else:
     optimizer=torch.optim.AdamW(groups,lr=1e-5,betas=(0.9,0.999),eps=1e-8,fused=True)
 engine,_,_,_=deepspeed.initialize(model=model,optimizer=optimizer,config=config)
+checks.attach(optimizer)
 restore_buffers(engine.module,buffers,device)
+if args.diagnose_numerics:
+    # Only the replay traces intermediate features; normal training checks the
+    # loss and the real optimizer partitions at their update boundaries.
+    for name, module in (("merger", model.generative_merger),
+                         ("fusion", model.generative_fusion),
+                         ("language_model", qwen.model.language_model),
+                         ("lm_head", qwen.lm_head)):
+        def trace_output(module, inputs, output, name=name):
+            value = output.last_hidden_state if name == "language_model" else output
+            checks.check_tensors([(name, value)], "forward_activation")
+        module.register_forward_hook(trace_output)
 start=0
 best=None
 if args.resume:
@@ -149,7 +170,15 @@ def forward(batch,phase):
     features=[]
     for qid,_,example in batch:
         torch.manual_seed(sample_seed(qid,0,phase))
-        features.append(enc.encode(example,device))
+        feature = enc.encode(example,device)
+        if args.diagnose_numerics:
+            tensors = [(qid + "/wan", feature["wan"])]
+            tensors.extend((f"{qid}/visual/{i}", v) for i, v in enumerate(feature["visual"].pooler_output))
+            tensors.extend((f"{qid}/deepstack/{i}/{j}", v)
+                           for i, layer in enumerate(feature["visual"].deepstack_features)
+                           for j, v in enumerate(layer))
+            checks.check_tensors(tensors, "frozen_features")
+        features.append(feature)
     return engine(**features[0]).reshape(1) if len(features)==1 else engine(examples=features)
 
 indices=[]
@@ -183,9 +212,17 @@ for step in range(start,args.benchmark_steps or total):
     factor=step/warmup if step<warmup else .5*(1+math.cos(math.pi*(step-warmup)/(total-warmup)))
     for group in engine.optimizer.param_groups:group["lr"]=1e-5*factor
     ce=torch.zeros((),device=device)
+    step_qids=[]
     for micro in range(accum):
         batch=next(batches)
+        qids=[item[0] for item in batch]
+        step_qids.extend(qids)
+        checks.context={"step":step+1,"micro":micro+1,"qids":qids,
+                        "step_qids":list(step_qids),"lr":1e-5*factor}
+        if args.diagnose_numerics:
+            print("NUMERICS_CONTEXT",json.dumps(dict(checks.context,rank=rank)),flush=True)
         values=forward(batch,"train")
+        checks.check_loss(values)
         valid=sum(item[1] for item in batch)
         loss=values[:valid].sum()
         engine.backward(loss*(world*accum/n))
@@ -241,8 +278,12 @@ if args.benchmark_steps is not None:
     if rank==0:
         report={"measured_steps":len(measured_seconds),"warmup_steps":1,"qa":measured_examples,
                 "qa_per_s":measured_examples/max(r["seconds"] for r in ranks),"ranks":ranks,"protocol":protocol}
-        (out/"throughput.json").write_text(json.dumps(report,indent=2))
-        print("BENCHMARK",json.dumps(report),flush=True)
+        if args.diagnose_numerics:
+            (out/"numerics_replay.json").write_text(json.dumps(report,indent=2))
+            print("NUMERICS_REPLAY_FINITE",json.dumps(report),flush=True)
+        else:
+            (out/"throughput.json").write_text(json.dumps(report,indent=2))
+            print("BENCHMARK",json.dumps(report),flush=True)
 elif completed==total and rank==0:
     (out/"selected.json").write_text(json.dumps(dict(best,tag=f"step-{best['step']:06d}")))
 dist.destroy_process_group()
