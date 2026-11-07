@@ -91,7 +91,7 @@ if rank == 0:
         out.mkdir(parents=True,exist_ok=False)
         (out/"protocol.json").write_text(json.dumps(protocol))
 dist.barrier()
-checks = NumericalChecks(out, rank)
+checks = NumericalChecks(out, rank, record_changes=args.benchmark_steps is not None and not args.diagnose_numerics)
 if args.diagnose_numerics:
     torch.autograd.set_detect_anomaly(True, check_nan=True)
 processor = AutoProcessor.from_pretrained(args.qwen,local_files_only=True)
@@ -128,7 +128,6 @@ if args.cpu_adam:
 else:
     optimizer=torch.optim.AdamW(groups,lr=1e-5,betas=(0.9,0.999),eps=1e-8,fused=True)
 engine,_,_,_=deepspeed.initialize(model=model,optimizer=optimizer,config=config)
-checks.attach(optimizer)
 restore_buffers(engine.module,buffers,device)
 if args.diagnose_numerics:
     from linear_backward_trace import LinearBackwardTrace
@@ -154,6 +153,7 @@ if args.resume:
         raise ValueError("Checkpoint does not match the run")
     start=state["step"];best=state["best"]
     assert engine.global_steps==start
+checks.attach(optimizer)
 for row in rows+tune:
     row["path"]=str(data_dir/row["path"])
 order=sorted(range(len(rows)),key=lambda i:hashlib.sha256(("train-order-0:"+rows[i]["id"]).encode()).digest())
@@ -306,8 +306,14 @@ if args.benchmark_steps is not None:
                  "peak_reserved_gib":torch.cuda.max_memory_reserved(device)/2**30,
                  "nvml_samples":len(utilization),"mean_device_util_pct":sum(utilization)/len(utilization),
                  "min_device_free_gib":min(free_bytes)/2**30}
+    if not args.diagnose_numerics:
+        local_stats["training_acceptance"] = checks.acceptance(args.benchmark_steps, engine.global_steps)
     ranks=[None]*world
     dist.all_gather_object(ranks,local_stats)
+    if not args.diagnose_numerics and not all(r["training_acceptance"]["accepted"] for r in ranks):
+        if rank == 0:
+            (out/"training_acceptance_failed.json").write_text(json.dumps(ranks,indent=2,allow_nan=False))
+        raise RuntimeError("Training update acceptance failed; no throughput configuration was accepted")
     if rank==0:
         report={"measured_steps":len(measured_seconds),"warmup_steps":1,"qa":measured_examples,
                 "qa_per_s":measured_examples/max(r["seconds"] for r in ranks),"ranks":ranks,"protocol":protocol}

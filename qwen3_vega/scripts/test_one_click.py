@@ -24,8 +24,10 @@ class OneClickTest(unittest.TestCase):
         self.diagnostic_message = "Diagnostic replay completed successfully"
         self.diagnostic_rc = 0
         self.interrupt = False
+        self.missing_acceptance = False
+        self.bad_acceptance = False
         self.env = patch.dict(
-            os.environ, CUDA_VISIBLE_DEVICES="a,b,c,d", VSI_BENCH_DIR=str(self.work / "vsi")
+            os.environ, CUDA_VISIBLE_DEVICES="a,b,c,d", VSI_BENCH_DIR=str(self.work / "vsi"), VEGA_NO_OVERLAP="0"
         )
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -58,16 +60,23 @@ class OneClickTest(unittest.TestCase):
             out.mkdir()
             speed = 100 if (width, stride) == (2, 2) else 10 * width + stride
             ranks = [
-                {"rank": i, "min_device_free_gib": 3 if speed == 100 and i == 3 else 12}
+                {"rank": i, "min_device_free_gib": 3 if speed == 100 and i == 3 else 12,
+                 "training_acceptance": {"accepted": True, "expected_steps": 5, "final_engine_global_steps": 5}}
                 for i in range(4)
             ]
+            if self.missing_acceptance:
+                ranks[3].pop("training_acceptance")
+            if self.bad_acceptance:
+                ranks[2]["training_acceptance"]["accepted"] = False
             one_click.write_json(
-                out / "throughput.json", dict(qa_per_s=speed, qa=256, measured_steps=4, ranks=ranks)
+                out / "throughput.json", dict(qa_per_s=speed, qa=256, measured_steps=4, ranks=ranks,
+                                              protocol={"overlap_comm": "--no-overlap" not in cmd})
             )
         elif "--micro-batch" in cmd or cmd[1].endswith("pipeline.py"):
             out = Path(arg("--output"))
             out.mkdir(exist_ok=True)
             if self.interrupt:
+                one_click.write_json(out / "protocol.json", {"overlap_comm": "--no-overlap" not in cmd})
                 one_click.write_json(out / "step-001165.json", dict(step=1165))
                 raise subprocess.CalledProcessError(1, cmd)
             (out / "sp16k_vsi").mkdir()
@@ -107,6 +116,69 @@ class OneClickTest(unittest.TestCase):
         one_click.launch(self.work)
         self.assertTrue(self.calls[-1][1].endswith("pipeline.py"))
         self.assertEqual(json.loads((out / "selected.json").read_text())["tag"], "step-002329")
+
+    def test_no_overlap_reaches_every_trial_training_and_resume(self):
+        os.environ["VEGA_NO_OVERLAP"] = "1"
+        self.interrupt = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            one_click.launch(self.work)
+        training = [cmd for cmd in self.calls if "--micro-batch" in cmd]
+        self.assertEqual(len(training), 7)
+        self.assertTrue(all("--no-overlap" in cmd for cmd in training))
+        choice = json.loads((self.work / "speed_selection.json").read_text())
+        self.assertIs(choice["overlap_comm"], False)
+        self.assertEqual(choice["acceptance_version"], 1)
+        del os.environ["VEGA_NO_OVERLAP"]
+        self.interrupt = False
+        self.calls.clear()
+        one_click.launch(self.work)
+        self.assertIn("--no-overlap", self.calls[-1])
+        self.assertEqual(self.calls[-1][-2:], ["--resume", "step-001165"])
+        self.assertFalse(any("--benchmark-steps" in cmd for cmd in self.calls))
+
+    def test_resume_rejects_changing_checkpoint_overlap_before_preparation(self):
+        self.interrupt = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            one_click.launch(self.work)
+        self.calls.clear()
+        os.environ["VEGA_NO_OVERLAP"] = "1"
+        with self.assertRaisesRegex(ValueError, "differs from the existing checkpoint"):
+            one_click.launch(self.work)
+        self.assertEqual(self.calls, [])
+
+    def test_old_selection_is_remeasured_and_preserved(self):
+        old = dict(gpus="a,b,c,d", winner={"micro_batch": 1, "checkpoint_every": 1})
+        one_click.write_json(self.work / "speed_selection.json", old)
+        original = (self.work / "speed_selection.json").read_bytes()
+        os.environ["VEGA_NO_OVERLAP"] = "1"
+        one_click.launch(self.work)
+        self.assertEqual(sum("--benchmark-steps" in cmd for cmd in self.calls), 6)
+        backups = list((self.work / "logs").glob("speed-selection-prior-*.json"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        self.assertIn("--no-overlap", self.calls[-1])
+
+    def test_incomplete_or_failed_update_acceptance_never_starts_training(self):
+        for flag in ("missing_acceptance", "bad_acceptance"):
+            with self.subTest(flag=flag):
+                setattr(self, flag, True)
+                self.calls.clear()
+                with self.assertRaisesRegex(ValueError, "Five real optimizer updates"):
+                    one_click.launch(self.work)
+                self.assertFalse((self.work / "speed_selection.json").exists())
+                self.assertFalse(list((self.work / "runs").glob("full-*")))
+                self.assertEqual(sum("--benchmark-steps" in cmd for cmd in self.calls), 1)
+                setattr(self, flag, False)
+
+    def test_overlap_failure_replay_keeps_flag_and_stays_stopped(self):
+        os.environ["VEGA_NO_OVERLAP"] = "1"
+        self.failure_message = "[rank2]: FloatingPointError: Nonfinite loss at step 2\n"
+        with self.assertRaisesRegex(RuntimeError, "training remains stopped"):
+            one_click.launch(self.work)
+        commands = [cmd for cmd in self.calls if "--benchmark-steps" in cmd]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all("--no-overlap" in cmd for cmd in commands))
+        self.assertFalse(list((self.work / "runs").glob("full-*")))
 
     def test_non_oom_failure_stops(self):
         self.fatal = True

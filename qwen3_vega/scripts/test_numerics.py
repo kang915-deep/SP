@@ -117,6 +117,66 @@ class NumericalChecksTest(unittest.TestCase):
         self.assertEqual(report["stats"]["min"], 3.)
         self.assertEqual(report["stats"]["max"], "inf")
 
+    def test_partitioned_update_acceptance_rejects_incomplete_or_noop_runs(self):
+        cases = [
+            ("complete", None, None, True, False, (0., 1e-5), 2, True),
+            ("missing_group", 1, None, True, False, (0., 1e-5), 2, False),
+            ("no_gradient", None, None, False, False, (0., 1e-5), 2, False),
+            ("skipped_step", None, 2, True, False, (0., 1e-5), 2, False),
+            ("zero_lr_only", None, None, True, False, (0., 0.), 2, False),
+            ("unchanged_parameters", None, None, True, True, (0., 1e-5), 2, False),
+            ("wrong_engine_steps", None, None, True, False, (0., 1e-5), 3, False),
+        ]
+        for name, missing, skipped, has_grad, zero_grad, rates, engine_steps, expected in cases:
+            with self.subTest(name=name), contextlib.redirect_stdout(io.StringIO()):
+                parameters = [torch.nn.Parameter(torch.tensor([1., -2.])),
+                              torch.nn.Parameter(torch.tensor([3., 4.]))]
+                optimizer = torch.optim.AdamW([{"params": [p]} for p in parameters],
+                                             lr=0., weight_decay=0.)
+                checks = NumericalChecks(self.out, rank=2, record_changes=True)
+                checks.attach(optimizer)
+                original_groups = optimizer.param_groups
+                for step, lr in enumerate(rates, 1):
+                    checks.context = {"step": step, "micro": 16, "qids": ["qa"], "lr": lr}
+                    if step == skipped:
+                        continue
+                    for index, group in enumerate(original_groups):
+                        if index == missing:
+                            continue
+                        group["lr"] = lr
+                        parameter = group["params"][0]
+                        parameter.grad = (torch.zeros_like(parameter) if zero_grad else
+                                          torch.ones_like(parameter)) if has_grad else None
+                        # Match ZeRO2's per-group temporary optimizer view.
+                        optimizer.param_groups = [group]
+                        optimizer.step()
+                    optimizer.param_groups = original_groups
+                report = checks.acceptance(2, engine_steps)
+                self.assertEqual(report["accepted"], expected)
+                self.assertEqual(report["expected_group_count"], 2)
+                if expected:
+                    self.assertEqual(report["completed_optimizer_steps"], [1, 2])
+                    self.assertEqual(report["nonzero_lr_optimizer_steps"], [2])
+                    self.assertEqual(report["changed_parameter_steps"], [2])
+                    self.assertEqual(report["optimizer_calls"], 4)
+
+    def test_change_sampling_is_bounded_and_does_not_change_adam_result(self):
+        parameter = torch.nn.Parameter(torch.linspace(-1., 1., 10000))
+        reference_parameter = torch.nn.Parameter(parameter.detach().clone())
+        optimizer = torch.optim.AdamW([parameter], lr=1e-5)
+        reference = torch.optim.AdamW([reference_parameter], lr=1e-5)
+        checks = NumericalChecks(self.out, rank=0, record_changes=True)
+        checks.context = {"step": 2, "micro": 16, "qids": ["qa"], "lr": 1e-5}
+        checks.attach(optimizer)
+        parameter.grad = torch.ones_like(parameter)
+        reference_parameter.grad = torch.ones_like(reference_parameter)
+        with contextlib.redirect_stdout(io.StringIO()):
+            optimizer.step()
+        reference.step()
+        self.assertLessEqual(sum(before.numel() for _, _, before in checks.parameter_samples), 1024)
+        self.assertEqual(checks.changed_parameter_steps, {2})
+        torch.testing.assert_close(parameter, reference_parameter, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

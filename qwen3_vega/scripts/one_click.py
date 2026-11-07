@@ -22,7 +22,7 @@ def write_json(path, value):
     temp.replace(path)
 
 
-def benchmark(work, inputs):
+def benchmark(work, inputs, no_overlap=False):
     sweep = Path(tempfile.mkdtemp(prefix="sweep-", dir=work / "logs"))
     trials = []
     for width in (1, 2):
@@ -44,6 +44,8 @@ def benchmark(work, inputs):
                 "--benchmark-steps",
                 "5",
             ]
+            if no_overlap:
+                cmd.append("--no-overlap")
             with log.open("w") as stream:
                 rc = subprocess.run(cmd, stdout=stream, stderr=subprocess.STDOUT).returncode
             trial = {"micro_batch": width, "checkpoint_every": stride, "log": str(log)}
@@ -85,6 +87,14 @@ def benchmark(work, inputs):
                     or speed <= 0
                 ):
                     raise ValueError(f"Incomplete four-GPU measurement in {out}")
+                protocol = report["protocol"]
+                if (protocol.get("diagnose_numerics", False)
+                        or protocol.get("overlap_comm", True) != (not no_overlap)
+                        or any(r.get("training_acceptance", {}).get("accepted") is not True
+                               or r["training_acceptance"]["expected_steps"] != 5
+                               or r["training_acceptance"]["final_engine_global_steps"] != 5
+                               for r in ranks)):
+                    raise ValueError(f"Five real optimizer updates were not accepted on every GPU: {out}")
                 free = min(r["min_device_free_gib"] for r in ranks)
                 trial.update(
                     qa_per_s=speed,
@@ -107,6 +117,8 @@ def benchmark(work, inputs):
         "trials": trials,
         "gpus": os.environ["CUDA_VISIBLE_DEVICES"],
         "effective_batch": 64,
+        "overlap_comm": not no_overlap,
+        "acceptance_version": 1,
     }
 
 
@@ -119,6 +131,23 @@ def launch(work):
     assets = work / "assets"
     runs = work / "runs"
     runs.mkdir(exist_ok=True)
+    selection = work / "speed_selection.json"
+    attempts = sorted(runs.glob("full-*"))
+    run = attempts[-1] if attempts else None
+    markers = sorted(run.glob("step-*.json")) if run else []
+    has_progress = run and (markers or (run / "selected.json").exists())
+    choice = json.loads(selection.read_text()) if selection.exists() else None
+    setting = os.environ.get("VEGA_NO_OVERLAP")
+    if setting not in (None, "0", "1"):
+        raise ValueError("VEGA_NO_OVERLAP must be 0 or 1")
+    no_overlap = setting == "1" if setting is not None else not (choice or {}).get("overlap_comm", True)
+    if markers and not (run / "selected.json").exists() and markers[-1].stem != "step-004657":
+        checkpoint_protocol = json.loads((run / "protocol.json").read_text())
+        recorded = not checkpoint_protocol.get("overlap_comm", True)
+        if setting is not None and no_overlap != recorded:
+            raise ValueError("Communication overlap differs from the existing checkpoint; leave VEGA_NO_OVERLAP unset to resume its recorded setting")
+        no_overlap = recorded
+    print(f"Training communication overlap: {not no_overlap}", flush=True)
     inputs = ["--qwen", str(assets / "qwen"), "--wan", str(assets / "wan"), "--data", str(data)]
     py = sys.executable
 
@@ -141,14 +170,14 @@ def launch(work):
     if not (vsi / "benchmark.json").is_file():
         subprocess.run([py, str(BASE / "sp" / "prepare.py"), "--output", str(vsi)], check=True)
 
-    selection = work / "speed_selection.json"
-    attempts = sorted(runs.glob("full-*"))
-    run = attempts[-1] if attempts else None
-    markers = sorted(run.glob("step-*.json")) if run else []
-    has_progress = run and (markers or (run / "selected.json").exists())
-    choice = json.loads(selection.read_text()) if selection.exists() else None
-    if not has_progress and (not choice or choice["gpus"] != os.environ["CUDA_VISIBLE_DEVICES"]):
-        choice = benchmark(work, inputs)
+    if not has_progress and (not choice or choice["gpus"] != os.environ["CUDA_VISIBLE_DEVICES"]
+                             or choice.get("overlap_comm", True) != (not no_overlap)
+                             or choice.get("acceptance_version") != 1):
+        choice = benchmark(work, inputs, no_overlap=no_overlap)
+        if selection.exists():
+            with tempfile.NamedTemporaryFile(prefix="speed-selection-prior-", suffix=".json",
+                                             dir=work / "logs", delete=False) as previous:
+                previous.write(selection.read_bytes())
         write_json(selection, choice)
     if not choice:
         raise RuntimeError("Missing speed_selection.json for existing training checkpoints")
@@ -179,6 +208,8 @@ def launch(work):
             "--save-every",
             "4657",
         ]
+        if no_overlap:
+            cmd.append("--no-overlap")
         if last:
             cmd.extend(["--resume", last.stem])
         subprocess.run(cmd, check=True)
