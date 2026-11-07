@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from numerics_log import failure_summary
 
 SCRIPTS = Path(__file__).resolve().parent
 BASE = SCRIPTS.parent
@@ -69,18 +70,7 @@ def benchmark(work, inputs):
                         ))
                     summaries = []
                     for heading, content in failures:
-                        lines = content.splitlines()
-                        wrappers = [i for i, line in enumerate(lines) if "ChildFailedError" in line]
-                        end = wrappers[-1] if wrappers else len(lines)
-                        errors = [i for i, line in enumerate(lines[:end]) if re.match(
-                            r"^\s*(?:\[rank\d+\]:\s*)?[\w.]*(?:Error|Exception)\s*:", line)]
-                        if errors:
-                            ranked = [i for i in errors if re.match(r"^\s*\[rank\d+\]:", lines[i])]
-                            index = ranked[-1] if ranked else errors[-1]
-                            summary = "\n".join(lines[max(0, index - 14):index + 5])
-                        else:
-                            summary = content[-3000:]
-                        summaries.append(f"{heading}:\n{summary}")
+                        summaries.append(f"{heading}:\n{failure_summary(content)}")
                     raise RuntimeError("\n\n".join(summaries))
                 trial["status"] = "cuda_oom"
             else:

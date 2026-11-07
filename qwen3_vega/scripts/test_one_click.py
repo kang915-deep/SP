@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import one_click
+from test_numerics_log import diagnostic_log
 
 
 class OneClickTest(unittest.TestCase):
@@ -171,6 +172,21 @@ class OneClickTest(unittest.TestCase):
         self.assertEqual(sum("--benchmark-steps" in cmd for cmd in self.calls), 2)
         self.assertEqual(sum("--diagnose-numerics" in cmd for cmd in self.calls), 1)
         self.assertFalse((self.work / "speed_selection.json").exists())
+
+    def test_anomaly_forward_traceback_and_sample_context_reach_launcher_error(self):
+        self.failure_message = "[rank2]: FloatingPointError: Nonfinite optimizer_gradient at step 1\n"
+        self.diagnostic_message = diagnostic_log()
+        self.diagnostic_rc = 1
+        with self.assertRaises(RuntimeError) as caught:
+            one_click.launch(self.work)
+        summary = str(caught.exception)
+        self.assertIn("FORWARD TRACEBACK (rank 2)", summary)
+        self.assertIn("forward_frame_0.py", summary)
+        self.assertIn("train_model.py", summary)
+        self.assertIn("failing-qa", summary)
+        self.assertIn("MmBackward0' returned nan", summary)
+        self.assertNotIn("other-qa", summary)
+        self.assertEqual(sum("--diagnose-numerics" in cmd for cmd in self.calls), 1)
 
     def test_uuid_error_survives_nccl_cleanup_and_torchrun_wrapper(self):
         error = "[rank3]: ValueError: invalid literal for int() with base 10: 'GPU-uuid-3'"
