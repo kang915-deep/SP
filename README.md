@@ -34,6 +34,16 @@ bash start.sh /mnt/data 0,1,2,3
 python3 -B qwen3_vega/scripts/numerics_log.py DATA_DISK
 ```
 
+如果已有栈仍只显示 Qwen MLP 的 `MmBackward0`，无法分出具体层及 `gate_proj/up_proj/down_proj`，可运行一次有明确终点的定位：
+
+```bash
+python3 -B qwen3_vega/scripts/diagnose_numerics.py DATA_DISK 0,1,2,3
+```
+
+此命令复用已装环境、数据与权重，每卡仅跑原排序的前两条 QA，保留有效 batch 64、梯度累积 16、BF16、ZeRO2、通信重叠及全层重算，在任何 Adam 更新前结束。它不下载、不执行测速选择，也不接后续训练或 SP；有同工作目录任务正在运行时立即退出。日志和新诊断结果保存在本机运行时的 `logs/linear-diagnostic-*/`，不覆盖旧日志。
+
+发生异常时直接输出完整层名、micro、题目和首个观察到的非有限阶段：`G_incoming` 表示传入该矩阵的梯度已异常，`dX_mm` 或 `dWeightTranspose_mm` 表示该矩阵乘法的反向输出异常。正常时保存 `diagnostic_prefix.json`，确认所有 rank 零次参数更新。检查会同步 GPU，可能使时序问题暂时不出现；定位通过不能当作原四卡训练已修复。正常训练不安装这些逐层检查。
+
 若训练媒体在对象存储上下载中断，请保留 `.part` 和同名的 `.part.ranges/` 目录。重跑时会只读已有前缀，将剩余数据按最多 128 MiB 一块下载到运行时临时目录，再将每块写成数据盘上的独立文件。脚本在解压前校验整包 SHA-256，无需手动拼接。日志中的 `Range download` 显示已有前缀大小，`Writing new range` 显示正在保存的字节区间。
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。

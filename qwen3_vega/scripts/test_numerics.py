@@ -57,6 +57,7 @@ class NumericalChecksTest(unittest.TestCase):
                     for key in optimizer.state[actual]:
                         torch.testing.assert_close(optimizer.state[actual][key], reference.state[expected][key], rtol=0, atol=0)
         self.assertEqual(output.getvalue().count("NUMERICS_OPTIMIZER_PARTITION"), 2)
+        self.assertEqual(self.checks.updates, 3)
         self.assertFalse((self.out / "numerics-rank2.json").exists())
 
     def test_bad_loss_stops_before_backward(self):
@@ -80,6 +81,7 @@ class NumericalChecksTest(unittest.TestCase):
             optimizer.step()
         self.assertEqual(parameter.item(), 0.)
         self.assertEqual(len(optimizer.state), 0)
+        self.assertEqual(self.checks.updates, 0)
         report = self.report("optimizer_gradient")
         self.assertEqual(report["stats"]["dtype"], "torch.float32")
         self.assertEqual(report["stats"]["max"], "inf")
@@ -96,6 +98,7 @@ class NumericalChecksTest(unittest.TestCase):
         with self.assertRaisesRegex(FloatingPointError, "Nonfinite optimizer_parameter at step 1"):
             optimizer.step()
         self.assertIsNone(inactive.grad)
+        self.assertEqual(self.checks.updates, 1)
         report = self.report("optimizer_parameter")
         self.assertEqual(report["stats"]["group"], 1)
         self.assertEqual(report["stats"]["partition"], 0)

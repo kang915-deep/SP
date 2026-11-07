@@ -30,6 +30,7 @@ parser.add_argument("--checkpoint-every", type=int, choices=(0, 1, 2), default=1
                     help="Recompute every decoder layer (1), alternate layers (2), or none (0)")
 parser.add_argument("--benchmark-steps", type=int, help="Measure full optimizer updates in a fresh run, without checkpoint I/O or downstream stages")
 parser.add_argument("--diagnose-numerics", action="store_true", help="Trace nonfinite operations in a separate benchmark replay; never use its timing for configuration selection")
+parser.add_argument("--diagnostic-micros", type=int, help="Stop a numerical replay after this many first-step microbatches, before any optimizer update")
 parser.add_argument("--cpu-adam", action="store_true", help="Offload FP32 optimizer states to host RAM (slower, less VRAM)")
 parser.add_argument("--workers", type=int, default=2)
 parser.add_argument("--stop-after", type=int, help="Commit an optimizer checkpoint and exit after this global step")
@@ -46,6 +47,10 @@ width = args.micro_batch
 effective_batch = world * width if args.smoke else 64
 if not os.environ.get("CUDA_VISIBLE_DEVICES") or width < 1 or effective_batch % (world * width):
     parser.error("Set CUDA_VISIBLE_DEVICES explicitly; global batch must be divisible by world size * micro batch")
+accum = effective_batch//(world*width)
+if args.diagnostic_micros is not None and (
+        not args.diagnose_numerics or args.benchmark_steps is None or not 1 <= args.diagnostic_micros < accum):
+    parser.error("--diagnostic-micros requires a fresh numerical benchmark and 1 <= N < gradient accumulation steps")
 torch.cuda.set_device(local)
 # DeepSpeed 0.18.9's NVML memory query casts UUID visibility entries to int.
 # Use CUDA's logical device mapping and actual free bytes for this process.
@@ -71,6 +76,8 @@ if args.benchmark_steps is not None:
     protocol["benchmark_steps"] = args.benchmark_steps
 if args.diagnose_numerics:
     protocol["diagnose_numerics"] = True
+if args.diagnostic_micros is not None:
+    protocol["diagnostic_micros"] = args.diagnostic_micros
 out = args.output.resolve()
 if rank == 0:
     if args.resume:
@@ -107,7 +114,6 @@ decay=[];no_decay=[]
 for name,p in params:
     (no_decay if "bias" in name or id(p) in norm_ids or name.endswith("norm_weight") else decay).append(p)
 groups=[{"params":decay,"weight_decay":0.01},{"params":no_decay,"weight_decay":0.0}]
-accum = effective_batch//(world*width)
 config = {"train_batch_size":effective_batch,"train_micro_batch_size_per_gpu":width,"gradient_accumulation_steps":accum,
           "gradient_clipping":1.0,"bf16":{"enabled":True},"zero_allow_untested_optimizer":True,
           "zero_optimization":{"stage":2,"overlap_comm":True,"contiguous_gradients":True,
@@ -122,6 +128,11 @@ engine,_,_,_=deepspeed.initialize(model=model,optimizer=optimizer,config=config)
 checks.attach(optimizer)
 restore_buffers(engine.module,buffers,device)
 if args.diagnose_numerics:
+    from linear_backward_trace import LinearBackwardTrace
+    linears = {f"qwen.model.language_model.layers.{index}.mlp.{name}": getattr(layer.mlp, name)
+               for index, layer in enumerate(qwen.model.language_model.layers)
+               for name in ("gate_proj", "up_proj", "down_proj")}
+    linear_trace = LinearBackwardTrace(linears, out/f"linear-rank{rank}")
     # Only the replay traces intermediate features; normal training checks the
     # loss and the real optimizer partitions at their update boundaries.
     for name, module in (("merger", model.generative_merger),
@@ -189,7 +200,7 @@ batches=iter(loader(rows,indices,width))
 if rank==0:print("READY",json.dumps(dict(protocol,trainable=sum(p.numel() for _,p in params),start=start)),flush=True)
 measured_seconds=[]
 measured_examples=0
-if args.benchmark_steps is not None:
+if args.benchmark_steps is not None and args.diagnostic_micros is None:
     import threading
     import pynvml
     pynvml.nvmlInit()
@@ -220,12 +231,31 @@ for step in range(start,args.benchmark_steps or total):
         checks.context={"step":step+1,"micro":micro+1,"qids":qids,
                         "step_qids":list(step_qids),"lr":1e-5*factor}
         if args.diagnose_numerics:
+            linear_trace.set_context(**checks.context, rank=rank)
             print("NUMERICS_CONTEXT",json.dumps(dict(checks.context,rank=rank)),flush=True)
         values=forward(batch,"train")
         checks.check_loss(values)
         valid=sum(item[1] for item in batch)
         loss=values[:valid].sum()
         engine.backward(loss*(world*accum/n))
+        if args.diagnostic_micros is not None and micro+1 == args.diagnostic_micros:
+            torch.cuda.synchronize(device)
+            if engine.global_steps != 0 or checks.updates != 0:
+                raise RuntimeError("Numerical prefix unexpectedly performed an optimizer update")
+            local_report = {"rank":rank,"finite":True,"optimizer_updates":engine.global_steps,
+                            "checked_optimizer_updates":checks.updates,"context":dict(checks.context),
+                            "finite_scope":"loss, observed features, MLP Mm node gradients, anomaly checking",
+                            "diagnostic_only":True}
+            reports = [None]*world
+            dist.all_gather_object(reports, local_report)
+            linear_trace.close()
+            if rank == 0:
+                report = {"protocol":protocol,"ranks":reports,"diagnostic_only":True,
+                          "optimizer_updates":0,"training_completed":False}
+                (out/"diagnostic_prefix.json").write_text(json.dumps(report,indent=2,allow_nan=False))
+                print("NUMERICS_PREFIX_FINITE",json.dumps(report,allow_nan=False),flush=True)
+            dist.destroy_process_group()
+            raise SystemExit(0)
         engine.step()
         ce+=loss.detach()
     dist.all_reduce(ce)
@@ -286,4 +316,6 @@ if args.benchmark_steps is not None:
             print("BENCHMARK",json.dumps(report),flush=True)
 elif completed==total and rank==0:
     (out/"selected.json").write_text(json.dumps(dict(best,tag=f"step-{best['step']:06d}")))
+if args.diagnose_numerics:
+    linear_trace.close()
 dist.destroy_process_group()

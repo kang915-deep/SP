@@ -10,6 +10,7 @@ class NumericalChecks:
         self.out = out
         self.rank = rank
         self.context = {}
+        self.updates = 0
         self.gradient_stats = []
 
     @staticmethod
@@ -57,6 +58,7 @@ class NumericalChecks:
                     self._fail("optimizer_gradient", stats)
 
     def _after_step(self, optimizer, args, kwargs):
+        self.updates += 1
         parameter_stats = []
         for group_index, group in enumerate(optimizer.param_groups):
             for parameter_index, parameter in enumerate(group["params"]):
