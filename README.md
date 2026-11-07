@@ -44,6 +44,8 @@ python3 -B qwen3_vega/scripts/diagnose_numerics.py DATA_DISK 0,1,2,3
 
 发生异常时直接输出完整层名、micro、题目和首个观察到的非有限阶段：`G_incoming` 表示传入该矩阵的梯度已异常，`dX_mm` 或 `dWeightTranspose_mm` 表示该矩阵乘法的反向输出异常。正常时保存 `diagnostic_prefix.json`，确认所有 rank 零次参数更新。检查会同步 GPU，可能使时序问题暂时不出现；定位通过不能当作原四卡训练已修复。正常训练不安装这些逐层检查。
 
+需要单独检验通信重叠时，在同一诊断命令末尾加 `--no-overlap`。这只将 DeepSpeed 的 `overlap_comm` 改为 `False`，原 BF16、50M 通信桶、checkpoint、样本顺序及 batch 均保持；新协议记录该差异。运行前会自动从上次诊断的现有 `events.jsonl` 提取对应传入梯度的范围，与前向输入范围一起打印为 `PREVIOUS_FAILURE`，无需另找日志。这个对照通过只能支持通信重叠相关解释，还需要正式更新验收；默认训练配置不会自动改变。
+
 若训练媒体在对象存储上下载中断，请保留 `.part` 和同名的 `.part.ranges/` 目录。重跑时会只读已有前缀，将剩余数据按最多 128 MiB 一块下载到运行时临时目录，再将每块写成数据盘上的独立文件。脚本在解压前校验整包 SHA-256，无需手动拼接。日志中的 `Range download` 显示已有前缀大小，`Writing new range` 显示正在保存的字节区间。
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。

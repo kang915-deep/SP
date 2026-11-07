@@ -32,6 +32,7 @@ parser.add_argument("--benchmark-steps", type=int, help="Measure full optimizer 
 parser.add_argument("--diagnose-numerics", action="store_true", help="Trace nonfinite operations in a separate benchmark replay; never use its timing for configuration selection")
 parser.add_argument("--diagnostic-micros", type=int, help="Stop a numerical replay after this many first-step microbatches, before any optimizer update")
 parser.add_argument("--cpu-adam", action="store_true", help="Offload FP32 optimizer states to host RAM (slower, less VRAM)")
+parser.add_argument("--no-overlap", action="store_true", help="Disable ZeRO communication overlap for a recorded single-variable comparison")
 parser.add_argument("--workers", type=int, default=2)
 parser.add_argument("--stop-after", type=int, help="Commit an optimizer checkpoint and exit after this global step")
 parser.add_argument("--save-every", type=int, default=250)
@@ -78,6 +79,8 @@ if args.diagnose_numerics:
     protocol["diagnose_numerics"] = True
 if args.diagnostic_micros is not None:
     protocol["diagnostic_micros"] = args.diagnostic_micros
+if args.no_overlap:
+    protocol["overlap_comm"] = False
 out = args.output.resolve()
 if rank == 0:
     if args.resume:
@@ -116,7 +119,7 @@ for name,p in params:
 groups=[{"params":decay,"weight_decay":0.01},{"params":no_decay,"weight_decay":0.0}]
 config = {"train_batch_size":effective_batch,"train_micro_batch_size_per_gpu":width,"gradient_accumulation_steps":accum,
           "gradient_clipping":1.0,"bf16":{"enabled":True},"zero_allow_untested_optimizer":True,
-          "zero_optimization":{"stage":2,"overlap_comm":True,"contiguous_gradients":True,
+          "zero_optimization":{"stage":2,"overlap_comm":not args.no_overlap,"contiguous_gradients":True,
                               "reduce_bucket_size":50000000,"allgather_bucket_size":50000000},"steps_per_print":10000}
 if args.cpu_adam:
     from deepspeed.ops.adam import DeepSpeedCPUAdam

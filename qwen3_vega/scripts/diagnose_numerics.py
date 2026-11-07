@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data_disk", type=Path, help="Same DATA_DISK passed to start.sh")
     parser.add_argument("gpus", help="Four assigned physical GPU indices, e.g. 0,1,2,3")
+    parser.add_argument("--no-overlap", action="store_true", help="Change only DeepSpeed communication overlap for this diagnostic")
     args = parser.parse_args()
     cards = args.gpus.split(",")
     if len(cards) != 4 or any(not card.isdecimal() for card in cards) or len(set(map(int, cards))) != 4:
@@ -34,6 +36,30 @@ def main():
     # Same workspace lock as start.sh; never wait for cards or an active job.
     with (work / "launch.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Read the previous failure's existing scalar events; no model replay.
+        prior = sorted((runtime / "logs").glob("linear-diagnostic-*/result/linear-rank*/first_nonfinite.json"),
+                       key=lambda path: path.stat().st_mtime)
+        if prior:
+            previous_run = prior[-1].parents[1]
+            for path in sorted(previous_run.glob("linear-rank*/first_nonfinite.json")):
+                failure = json.loads(path.read_text())
+                incoming = None
+                with (path.parent / "events.jsonl").open() as events:
+                    for line in events:
+                        event = json.loads(line)
+                        if (event["name"] == failure["name"] and event["forward_call"] == failure["forward_call"]
+                                and event["phase"] == "G_incoming"):
+                            incoming = event["stats"]
+                x = failure["original_forward"]["x"]
+                bound = (math.prod(x["shape"][:-1]) * max(abs(x["min"]), abs(x["max"])) *
+                         max(abs(incoming["min"]), abs(incoming["max"]))) if (
+                             incoming and incoming["finite"] and x["finite"]) else None
+                print("PREVIOUS_FAILURE", json.dumps({
+                    "report": str(path), "name": failure["name"], "phase": failure["phase"],
+                    "context": failure["context"], "observed_x": x, "incoming_gradient": incoming,
+                    "observed_dot_product_abs_bound": bound,
+                    "bound_scope": "Uses observed forward X; actual saved Mm operands were not inspected",
+                }, allow_nan=False), flush=True)
         uuids = [subprocess.check_output(
             ["nvidia-smi", "-i", card, "--query-gpu=uuid", "--format=csv,noheader"], text=True
         ).strip() for card in cards]
@@ -57,8 +83,10 @@ def main():
                    "--data", str(work / "data"), "--output", str(out),
                    "--micro-batch", "1", "--checkpoint-every", "1", "--benchmark-steps", "2",
                    "--diagnose-numerics", "--diagnostic-micros", "2"]
+        if args.no_overlap:
+            command.append("--no-overlap")
         (diagnostic / "command.json").write_text(json.dumps(command, indent=2))
-        print(f"Two microbatches per rank, zero optimizer updates. Log: {log}", flush=True)
+        print(f"Two microbatches per rank, zero optimizer updates, overlap_comm={not args.no_overlap}. Log: {log}", flush=True)
         with log.open("x") as stream:
             rc = subprocess.run(command, env=env, stdout=stream, stderr=subprocess.STDOUT).returncode
         reports = sorted(out.glob("linear-rank*/first_nonfinite.json"))

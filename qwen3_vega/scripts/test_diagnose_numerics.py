@@ -28,7 +28,7 @@ class DiagnosticCommandTests(unittest.TestCase):
         self.environ.stop()
         self.temp.cleanup()
 
-    def invoke(self, rc=0):
+    def invoke(self, rc=0, extra=()):
         seen = {}
 
         def run(command, **kwargs):
@@ -46,7 +46,7 @@ class DiagnosticCommandTests(unittest.TestCase):
             return type("Result", (), {"returncode": rc})()
 
         output = io.StringIO()
-        with patch("sys.argv", ["diagnose", str(self.disk), "0,1,2,3"]), \
+        with patch("sys.argv", ["diagnose", str(self.disk), "0,1,2,3", *extra]), \
                 patch.object(diagnostic.subprocess, "check_output", side_effect=[f"GPU-test-{i}\n" for i in range(4)]), \
                 patch.object(diagnostic.subprocess, "run", side_effect=run), contextlib.redirect_stdout(output):
             result = diagnostic.main()
@@ -68,6 +68,36 @@ class DiagnosticCommandTests(unittest.TestCase):
         self.assertIn("layers.7.mlp.up_proj", output)
         self.assertIn("G_incoming", output)
         self.assertNotIn("Prefix completed", output)
+
+    def test_only_overlap_flag_changes_replay(self):
+        _, _, original = self.invoke()
+        _, output, changed = self.invoke(extra=("--no-overlap",))
+        before = original["command"].copy()
+        after = changed["command"].copy()
+        before[before.index("--output") + 1] = "NEW_OUTPUT"
+        after[after.index("--output") + 1] = "NEW_OUTPUT"
+        self.assertEqual(after, before + ["--no-overlap"])
+        self.assertEqual(original["env"], changed["env"])
+        self.assertIn("overlap_comm=False", output)
+
+    def test_reads_existing_incoming_gradient_without_mutating_logs(self):
+        rank = self.work / "logs/linear-diagnostic-existing/result/linear-rank2"
+        rank.mkdir(parents=True)
+        x = dict(shape=[1, 2125, 4096], min=-286., max=43.25, finite=True)
+        failure = dict(name="layers.35.mlp.up_proj", phase="dWeightTranspose_mm", forward_call=323,
+                       context=dict(rank=2, micro=2), original_forward={"x": x})
+        path = rank / "first_nonfinite.json"
+        path.write_text(json.dumps(failure))
+        records = [dict(name=failure["name"], forward_call=320, phase="G_incoming", stats=dict(min=-100., max=100., finite=True)),
+                   dict(name=failure["name"], forward_call=323, phase="G_incoming", stats=dict(min=-.125, max=.25, finite=True))]
+        events = rank / "events.jsonl"
+        events.write_text("\n".join(json.dumps(event) for event in records) + "\n")
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (path, events)}
+        _, output, _ = self.invoke(extra=("--no-overlap",))
+        summary = json.loads(next(line.split(" ", 1)[1] for line in output.splitlines() if line.startswith("PREVIOUS_FAILURE ")))
+        self.assertEqual(summary["incoming_gradient"]["max"], .25)
+        self.assertEqual(summary["observed_dot_product_abs_bound"], 2125 * 286 * .25)
+        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (path, events)}, before)
 
     def test_active_workspace_not_restarted(self):
         with (self.work / "launch.lock").open("a") as lock:
