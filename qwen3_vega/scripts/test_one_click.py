@@ -19,6 +19,7 @@ class OneClickTest(unittest.TestCase):
         (self.work / "logs").mkdir(parents=True)
         self.calls = []
         self.fatal = False
+        self.failure_message = None
         self.interrupt = False
         self.env = patch.dict(
             os.environ, CUDA_VISIBLE_DEVICES="a,b,c,d", VSI_BENCH_DIR=str(self.work / "vsi")
@@ -37,6 +38,9 @@ class OneClickTest(unittest.TestCase):
 
         if "--benchmark-steps" in cmd:
             width, stride = int(arg("--micro-batch")), int(arg("--checkpoint-every"))
+            if self.failure_message is not None:
+                opts["stdout"].write(self.failure_message)
+                return subprocess.CompletedProcess(cmd, 1)
             if self.fatal or (width, stride) == (2, 0):
                 print(
                     "bad data" if self.fatal else "torch.OutOfMemoryError: CUDA out of memory",
@@ -100,6 +104,35 @@ class OneClickTest(unittest.TestCase):
         self.fatal = True
         with self.assertRaisesRegex(RuntimeError, "bad data"):
             one_click.launch(self.work)
+        self.assertFalse((self.work / "speed_selection.json").exists())
+
+    def test_uuid_error_survives_nccl_cleanup_and_torchrun_wrapper(self):
+        error = "[rank3]: ValueError: invalid literal for int() with base 10: 'GPU-uuid-3'"
+        self.failure_message = "\n".join([
+            "[rank3]: Traceback (most recent call last):",
+            *[f"[rank3]: original context {i:02d}" for i in range(15)],
+            error,
+            *[f"[rank3]: following context {i}" for i in range(5)],
+            *("NCCL shutdown: cleaning communicator and waiting for peers" for _ in range(300)),
+            "Traceback (most recent call last):",
+            '  File "/env/bin/torchrun", line 8, in <module>',
+            "    raise ChildFailedError(name=entrypoint, failures=result.failures)",
+            "torch.distributed.elastic.multiprocessing.errors.ChildFailedError:",
+            "train.py FAILED; rank: 3; exitcode: 1",
+        ]) + "\n"
+        with self.assertRaises(RuntimeError) as caught:
+            one_click.launch(self.work)
+        summary = str(caught.exception)
+        self.assertIn(error, summary)
+        self.assertIn("original context 01", summary)
+        self.assertIn("following context 3", summary)
+        self.assertNotIn("original context 00", summary)
+        self.assertNotIn("following context 4", summary)
+        self.assertNotIn("NCCL shutdown", summary)
+        self.assertNotIn("ChildFailedError", summary)
+        logs = list((self.work / "logs").glob("sweep-*/m1-c1.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].read_text(), self.failure_message)
         self.assertFalse((self.work / "speed_selection.json").exists())
 
 

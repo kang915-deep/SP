@@ -49,7 +49,18 @@ def benchmark(work, inputs):
             if rc:
                 message = log.read_text(errors="replace")
                 if not CUDA_OOM.search(message):
-                    raise RuntimeError(f"Benchmark failed ({log}):\n{message[-3000:]}")
+                    lines = message.splitlines()
+                    wrappers = [i for i, line in enumerate(lines) if "ChildFailedError" in line]
+                    end = wrappers[-1] if wrappers else len(lines)
+                    errors = [i for i, line in enumerate(lines[:end]) if re.match(
+                        r"^\s*(?:\[rank\d+\]:\s*)?[\w.]*(?:Error|Exception)\s*:", line)]
+                    if errors:
+                        ranked = [i for i in errors if re.match(r"^\s*\[rank\d+\]:", lines[i])]
+                        index = ranked[-1] if ranked else errors[-1]
+                        summary = "\n".join(lines[max(0, index - 14):index + 5])
+                    else:
+                        summary = message[-3000:]
+                    raise RuntimeError(f"Benchmark failed ({log}):\n{summary}")
                 trial["status"] = "cuda_oom"
             else:
                 report = json.loads((out / "throughput.json").read_text())

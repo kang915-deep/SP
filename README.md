@@ -24,6 +24,8 @@ bash start.sh /mnt/data 0,1,2,3
 
 **中断后重跑同一条命令。** 同一工作目录最多启动一个一键任务。已有完整训练断点时从最近一次继续；尚未留下完整断点时保留旧输出，另开一次正式运行；底座已选好则直接接后续 SP 和评测。
 
+若旧版测速报 `ValueError: invalid literal for int() ... 'GPU-...'`，先 `git pull --ff-only`，再用原数据盘和四张卡重跑 `bash start.sh`。这是 DeepSpeed 0.18.9 查询显存时不兼容 UUID 的问题；新版在每个训练进程中改用 CUDA 的实际空闲显存查询，保留 UUID 选卡和训练设置，复用已准备的数据与权重。失败的测速日志保留，新测速写入新目录。
+
 若训练媒体在对象存储上下载中断，请保留 `.part` 和同名的 `.part.ranges/` 目录。重跑时会只读已有前缀，将剩余数据按最多 128 MiB 一块下载到运行时临时目录，再将每块写成数据盘上的独立文件。脚本在解压前校验整包 SHA-256，无需手动拼接。日志中的 `Range download` 显示已有前缀大小，`Writing new range` 显示正在保存的字节区间。
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。

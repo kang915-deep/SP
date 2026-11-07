@@ -43,6 +43,11 @@ effective_batch = world * width if args.smoke else 64
 if not os.environ.get("CUDA_VISIBLE_DEVICES") or width < 1 or effective_batch % (world * width):
     parser.error("Set CUDA_VISIBLE_DEVICES explicitly; global batch must be divisible by world size * micro batch")
 torch.cuda.set_device(local)
+# DeepSpeed 0.18.9's NVML memory query casts UUID visibility entries to int.
+# Use CUDA's logical device mapping and actual free bytes for this process.
+deepspeed.accelerator.get_accelerator().available_memory = (
+    lambda device_index=None: torch.cuda.mem_get_info(device_index)[0]
+)
 device = torch.device("cuda",local)
 dist.init_process_group("nccl",device_id=device)
 torch.manual_seed(0)
