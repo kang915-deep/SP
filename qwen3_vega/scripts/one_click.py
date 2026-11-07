@@ -1,6 +1,7 @@
 """Stages for start.sh. One process owns the workspace lock for the whole run."""
 
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -22,7 +23,65 @@ def write_json(path, value):
     temp.replace(path)
 
 
-def benchmark(work, inputs, no_overlap=False):
+def read_measurement(path, no_overlap, min_free_gib):
+    report = json.loads(path.read_text())
+    ranks = report["ranks"]
+    speed = report["qa_per_s"]
+    if (report["measured_steps"] != 4 or report["qa"] != 256
+            or sorted(r["rank"] for r in ranks) != list(range(4))
+            or not math.isfinite(speed) or speed <= 0):
+        raise ValueError(f"Incomplete four-GPU measurement in {path}")
+    protocol = report["protocol"]
+    if (protocol.get("diagnose_numerics", False)
+            or protocol.get("overlap_comm", True) != (not no_overlap)
+            or any(r.get("training_acceptance", {}).get("accepted") is not True
+                   or r["training_acceptance"]["expected_steps"] != 5
+                   or r["training_acceptance"]["final_engine_global_steps"] != 5
+                   for r in ranks)):
+        raise ValueError(f"Five real optimizer updates were not accepted on every GPU: {path}")
+    free_values = [r["min_device_free_gib"] for r in ranks]
+    if any(not math.isfinite(v) or v < 0 for v in free_values):
+        raise ValueError(f"Invalid measured GPU headroom: {path}")
+    free = min(free_values)
+    return protocol, dict(qa_per_s=speed, min_free_gib=free, report=str(path),
+                          status="eligible" if free >= min_free_gib else "low_headroom")
+
+
+def reuse_benchmark(work, source, no_overlap, min_free_gib):
+    source = source.resolve()
+    previous = json.loads((source / "trials.json").read_text())
+    expected = {(m, c) for m in (1, 2) for c in (1, 2, 0)}
+    if len(previous) != 6 or {(t["micro_batch"], t["checkpoint_every"]) for t in previous} != expected:
+        raise ValueError("The specified sweep has not completed all six configurations; let the existing launcher finish first")
+    hashes = {p + "_sha256": hashlib.sha256((work / "data" / (p + ".json")).read_bytes()).hexdigest()
+              for p in ("train", "tune")}
+    trials = []
+    for old in previous:
+        trial = dict(old)
+        if old["status"] not in ("eligible", "low_headroom", "cuda_oom"):
+            raise ValueError(f"Sweep contains an unfinished or failed configuration: {old}")
+        if old["status"] != "cuda_oom":
+            path = source / f"m{old['micro_batch']}-c{old['checkpoint_every']}" / "throughput.json"
+            protocol, measurement = read_measurement(path, no_overlap, min_free_gib)
+            identity = dict(hashes, world=4, micro_batch=old["micro_batch"], effective_batch=64,
+                            smoke=False, cpu_adam=False, benchmark_steps=5)
+            if (any(protocol.get(k) != v for k, v in identity.items())
+                    or protocol.get("checkpoint_every", 1) != old["checkpoint_every"]):
+                raise ValueError(f"Cached measurement uses different data or training settings: {path}")
+            trial.update(measurement)
+        trials.append(trial)
+    eligible = [t for t in trials if t["status"] == "eligible"]
+    if not eligible:
+        raise RuntimeError(f"No completed configuration left {min_free_gib} GiB on every GPU: {source}")
+    winner = max(eligible, key=lambda t: (t["qa_per_s"], t["min_free_gib"]))
+    print(f"Reusing completed sweep without GPU reruns: {source}; headroom floor={min_free_gib} GiB", flush=True)
+    return dict(winner=winner, min_free_gib=min_free_gib, trials=trials,
+                gpus=os.environ["CUDA_VISIBLE_DEVICES"], effective_batch=64,
+                overlap_comm=not no_overlap, acceptance_version=1, reused_sweep=str(source),
+                reuse_scope="Explicitly supplied same-machine/same-GPU sweep; cached headroom is historical")
+
+
+def benchmark(work, inputs, no_overlap=False, min_free_gib=MIN_FREE_GIB):
     sweep = Path(tempfile.mkdtemp(prefix="sweep-", dir=work / "logs"))
     trials = []
     for width in (1, 2):
@@ -76,44 +135,20 @@ def benchmark(work, inputs, no_overlap=False):
                     raise RuntimeError("\n\n".join(summaries))
                 trial["status"] = "cuda_oom"
             else:
-                report = json.loads((out / "throughput.json").read_text())
-                ranks = report["ranks"]
-                speed = report["qa_per_s"]
-                if (
-                    report["measured_steps"] != 4
-                    or report["qa"] != 256
-                    or sorted(r["rank"] for r in ranks) != list(range(4))
-                    or not math.isfinite(speed)
-                    or speed <= 0
-                ):
-                    raise ValueError(f"Incomplete four-GPU measurement in {out}")
-                protocol = report["protocol"]
-                if (protocol.get("diagnose_numerics", False)
-                        or protocol.get("overlap_comm", True) != (not no_overlap)
-                        or any(r.get("training_acceptance", {}).get("accepted") is not True
-                               or r["training_acceptance"]["expected_steps"] != 5
-                               or r["training_acceptance"]["final_engine_global_steps"] != 5
-                               for r in ranks)):
-                    raise ValueError(f"Five real optimizer updates were not accepted on every GPU: {out}")
-                free = min(r["min_device_free_gib"] for r in ranks)
-                trial.update(
-                    qa_per_s=speed,
-                    min_free_gib=free,
-                    report=str(out / "throughput.json"),
-                    status="eligible" if free >= MIN_FREE_GIB else "low_headroom",
-                )
+                _, measurement = read_measurement(out / "throughput.json", no_overlap, min_free_gib)
+                trial.update(measurement)
             trials.append(trial)
             write_json(sweep / "trials.json", trials)
             print(trial, flush=True)
     eligible = [t for t in trials if t["status"] == "eligible"]
     if not eligible:
         raise RuntimeError(
-            f"No measured configuration left {MIN_FREE_GIB} GiB on every GPU. See {sweep}"
+            f"No measured configuration left {min_free_gib} GiB on every GPU. See {sweep}"
         )
     winner = max(eligible, key=lambda t: (t["qa_per_s"], t["min_free_gib"]))
     return {
         "winner": winner,
-        "min_free_gib": MIN_FREE_GIB,
+        "min_free_gib": min_free_gib,
         "trials": trials,
         "gpus": os.environ["CUDA_VISIBLE_DEVICES"],
         "effective_batch": 64,
@@ -137,6 +172,10 @@ def launch(work):
     markers = sorted(run.glob("step-*.json")) if run else []
     has_progress = run and (markers or (run / "selected.json").exists())
     choice = json.loads(selection.read_text()) if selection.exists() else None
+    min_free_gib = float(os.environ.get("VEGA_MIN_FREE_GIB", (choice or {}).get("min_free_gib", MIN_FREE_GIB)))
+    if not math.isfinite(min_free_gib) or min_free_gib <= 0:
+        raise ValueError("VEGA_MIN_FREE_GIB must be finite and positive")
+    reuse = os.environ.get("VEGA_REUSE_SWEEP")
     setting = os.environ.get("VEGA_NO_OVERLAP")
     if setting not in (None, "0", "1"):
         raise ValueError("VEGA_NO_OVERLAP must be 0 or 1")
@@ -172,8 +211,10 @@ def launch(work):
 
     if not has_progress and (not choice or choice["gpus"] != os.environ["CUDA_VISIBLE_DEVICES"]
                              or choice.get("overlap_comm", True) != (not no_overlap)
+                             or choice.get("min_free_gib") != min_free_gib or reuse
                              or choice.get("acceptance_version") != 1):
-        choice = benchmark(work, inputs, no_overlap=no_overlap)
+        choice = (reuse_benchmark(work, Path(reuse), no_overlap, min_free_gib) if reuse else
+                  benchmark(work, inputs, no_overlap=no_overlap, min_free_gib=min_free_gib))
         if selection.exists():
             with tempfile.NamedTemporaryFile(prefix="speed-selection-prior-", suffix=".json",
                                              dir=work / "logs", delete=False) as previous:

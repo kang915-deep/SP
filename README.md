@@ -55,6 +55,18 @@ git pull --ff-only && VEGA_NO_OVERLAP=1 bash start.sh DATA_DISK 0,1,2,3
 
 它复用已准备的数据与权重，把关闭通信重叠贯穿全部五步测速和正式训练；仍按原规则选最快的合格配置，训练结束继续 16K SP 和完整 VSI。旧测速若没有真实更新验收或采用不同的重叠设置，会重新测速，旧选择记录另存到 `logs/speed-selection-prior-*.json`。`speed_selection.json` 和训练 `protocol.json` 记录重叠设置；已有完整断点时，即使不再填写该环境变量，也按断点的设置续训。若显式指定的设置与已有断点冲突，入口停止，不静默更改断点。此选项不改变数据、Loss、BF16、有效 batch、学习率或训练预算；关闭通信重叠可能影响吞吐，实际速度由该机测速决定。诊断通过不等于目标机器已完成真实更新验收。
 
+**测速显示 `low_headroom` 时：** 表示真实更新验收已过，但最小剩余显存不足默认 8 GiB，不等于出现 NaN 或 CUDA OOM。允许通过 `VEGA_MIN_FREE_GIB=4` 显式采用 4 GiB 筛选门槛，记录在选择结果中。这只是前五步测得的余量，更长样本和验证仍可能需要更多显存。
+
+如果同一台机器、同四张卡的六组测速已经全部结束，可明确指定原 sweep 目录重新筛选，避免重跑 GPU 测速：
+
+```bash
+VEGA_NO_OVERLAP=1 VEGA_MIN_FREE_GIB=4 \
+VEGA_REUSE_SWEEP=DATA_DISK/qwen3-vega/logs/sweep-实际编号 \
+bash start.sh DATA_DISK 0,1,2,3
+```
+
+脚本只读原六组结果，重新核验四卡真实更新验收、数据 SHA 和训练设置，并按新门槛选最快的合格配置；旧日志和报告不改动。六组必须全部结束（可包含已记录的 CUDA OOM），未完成或其他错误不能跳过。早期报告没有 GPU UUID，脚本不能自动证明历史硬件相同，因此只允许调用者明确指定本机同四卡的结果，不能跨机器复用。当前任务还在运行时仍由原工作目录锁拒绝重复启动，不自动等卡、不终止进程。已有完整训练断点时保持原配置续训，不因余量门槛重新选择 micro-batch 或 checkpoint。
+
 若训练媒体在对象存储上下载中断，请保留 `.part` 和同名的 `.part.ranges/` 目录。重跑时会只读已有前缀，将剩余数据按最多 128 MiB 一块下载到运行时临时目录，再将每块写成数据盘上的独立文件。脚本在解压前校验整包 SHA-256，无需手动拼接。日志中的 `Range download` 显示已有前缀大小，`Writing new range` 显示正在保存的字节区间。
 
 Hound 帧包遇到网络中断时可自动从 ModelScope 的固定版本续传。也可在启动命令前加 `HOUND_SOURCE=modelscope`，直接用 ModelScope 下载 Hound 帧包。16 个包使用同一份大小和 SHA-256 清单，已有分块可复用。

@@ -1,6 +1,7 @@
 """Offline regression tests for orchestration. Accelerator jobs are replaced at the process boundary."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -31,6 +32,8 @@ class OneClickTest(unittest.TestCase):
         )
         self.env.start()
         self.addCleanup(self.env.stop)
+        os.environ.pop("VEGA_MIN_FREE_GIB", None)
+        os.environ.pop("VEGA_REUSE_SWEEP", None)
         proc = patch.object(one_click.subprocess, "run", side_effect=self.run_stage)
         proc.start()
         self.addCleanup(proc.stop)
@@ -85,6 +88,123 @@ class OneClickTest(unittest.TestCase):
                 dict(questions=5130, overall={"baseline": 1, "sp": 2}),
             )
         return subprocess.CompletedProcess(cmd, 0)
+
+    def completed_sweep(self, name="sweep-reuse"):
+        source = self.work / "logs" / name
+        source.mkdir()
+        data = self.work / "data"
+        data.mkdir(exist_ok=True)
+        hashes = {}
+        for part in ("train", "tune"):
+            raw = json.dumps([{"id": part}]).encode()
+            (data / (part + ".json")).write_bytes(raw)
+            hashes[part + "_sha256"] = hashlib.sha256(raw).hexdigest()
+        measurements = [
+            (1, 1, .851647304, 6.78967285),
+            (1, 2, .876562407, 1.025390625),
+            (1, 0, .900551552, 2.3984375),
+            (2, 1, .838145732, 6.787719726),
+            (2, 2, .88, 1.2),
+            (2, 0, None, None),
+        ]
+        trials = []
+        for width, stride, speed, free in measurements:
+            out = source / f"m{width}-c{stride}"
+            trial = dict(micro_batch=width, checkpoint_every=stride,
+                         log=str(out.with_suffix(".log")), status="cuda_oom")
+            if speed is not None:
+                out.mkdir()
+                protocol = dict(hashes, world=4, micro_batch=width, effective_batch=64,
+                                smoke=False, cpu_adam=False, benchmark_steps=5, overlap_comm=False)
+                if stride != 1:
+                    protocol["checkpoint_every"] = stride
+                report = dict(qa_per_s=speed, qa=256, measured_steps=4, warmup_steps=1,
+                              protocol=protocol, ranks=[dict(
+                                  rank=i, min_device_free_gib=free + .1*i,
+                                  training_acceptance=dict(accepted=True, expected_steps=5,
+                                                           final_engine_global_steps=5))
+                                  for i in range(4)])
+                one_click.write_json(out / "throughput.json", report)
+                trial.update(qa_per_s=speed, min_free_gib=free, status="low_headroom",
+                             report=str(out / "throughput.json"))
+            trials.append(trial)
+        one_click.write_json(source / "trials.json", trials)
+        return source
+
+    def test_reuse_sweep_at_four_gib_avoids_benchmark_and_preserves_source(self):
+        source = self.completed_sweep()
+        original = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in source.rglob("*.json")}
+        os.environ.update(VEGA_NO_OVERLAP="1", VEGA_MIN_FREE_GIB="4", VEGA_REUSE_SWEEP=str(source))
+        one_click.launch(self.work)
+        choice = json.loads((self.work / "speed_selection.json").read_text())
+        self.assertEqual((choice["winner"]["micro_batch"], choice["winner"]["checkpoint_every"]), (1, 1))
+        self.assertAlmostEqual(choice["winner"]["qa_per_s"], .851647304)
+        self.assertEqual(choice["min_free_gib"], 4.)
+        self.assertEqual(choice["reused_sweep"], str(source.resolve()))
+        self.assertEqual([t["status"] for t in choice["trials"]],
+                         ["eligible", "low_headroom", "low_headroom", "eligible", "low_headroom", "cuda_oom"])
+        self.assertFalse(any("--benchmark-steps" in cmd for cmd in self.calls))
+        self.assertIn("--no-overlap", self.calls[-1])
+        for path, before in original.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_reuse_rejects_incomplete_or_incompatible_measurements(self):
+        for defect in ("incomplete", "hash", "overlap", "acceptance", "nan_headroom", "diagnostic", "batch"):
+            with self.subTest(defect=defect):
+                source = self.completed_sweep("sweep-" + defect)
+                path = source / "m1-c1" / "throughput.json"
+                report = json.loads(path.read_text())
+                if defect == "incomplete":
+                    trials = json.loads((source / "trials.json").read_text())
+                    one_click.write_json(source / "trials.json", trials[:-1])
+                elif defect == "hash":
+                    report["protocol"]["train_sha256"] = "different-dataset"
+                elif defect == "overlap":
+                    report["protocol"]["overlap_comm"] = True
+                elif defect == "acceptance":
+                    report["ranks"][2]["training_acceptance"]["accepted"] = False
+                elif defect == "nan_headroom":
+                    report["ranks"][3]["min_device_free_gib"] = float("nan")
+                elif defect == "diagnostic":
+                    report["protocol"]["diagnose_numerics"] = True
+                else:
+                    report["protocol"]["effective_batch"] = 32
+                path.write_text(json.dumps(report))
+                os.environ.update(VEGA_NO_OVERLAP="1", VEGA_MIN_FREE_GIB="4", VEGA_REUSE_SWEEP=str(source))
+                self.calls.clear()
+                with self.assertRaises(ValueError):
+                    one_click.launch(self.work)
+                self.assertFalse(any("--micro-batch" in cmd for cmd in self.calls))
+                self.assertFalse((self.work / "speed_selection.json").exists())
+                self.assertFalse(list((self.work / "runs").glob("full-*")))
+
+    def test_new_headroom_and_reuse_do_not_change_existing_checkpoint_config(self):
+        os.environ["VEGA_NO_OVERLAP"] = "1"
+        self.interrupt = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            one_click.launch(self.work)
+        selection = self.work / "speed_selection.json"
+        original = selection.read_bytes()
+        source = self.completed_sweep()
+        os.environ.update(VEGA_MIN_FREE_GIB="4", VEGA_REUSE_SWEEP=str(source))
+        self.interrupt = False
+        self.calls.clear()
+        one_click.launch(self.work)
+        command = self.calls[-1]
+        self.assertEqual(command[command.index("--micro-batch") + 1], "2")
+        self.assertEqual(command[command.index("--checkpoint-every") + 1], "1")
+        self.assertEqual(command[-2:], ["--resume", "step-001165"])
+        self.assertFalse(any("--benchmark-steps" in cmd for cmd in self.calls))
+        self.assertEqual(selection.read_bytes(), original)
+
+    def test_invalid_headroom_stops_before_preparation(self):
+        for value in ("nan", "inf", "0", "-1"):
+            with self.subTest(value=value):
+                os.environ["VEGA_MIN_FREE_GIB"] = value
+                self.calls.clear()
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    one_click.launch(self.work)
+                self.assertEqual(self.calls, [])
 
     def test_select_and_resume(self):
         self.interrupt = True
