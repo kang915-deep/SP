@@ -13,6 +13,8 @@ from numerics_log import failure_summary
 
 SCRIPTS = Path(__file__).resolve().parent
 BASE = SCRIPTS.parent
+sys.path.insert(0, str(BASE))
+from validation_checkpoint import completed_selection
 MIN_FREE_GIB = 8
 CUDA_OOM = re.compile(r"CUDA out of memory|CUDA error: out of memory|cudaErrorMemoryAllocation", re.I)
 
@@ -180,7 +182,11 @@ def launch(work):
     if setting not in (None, "0", "1"):
         raise ValueError("VEGA_NO_OVERLAP must be 0 or 1")
     no_overlap = setting == "1" if setting is not None else not (choice or {}).get("overlap_comm", True)
-    if markers and not (run / "selected.json").exists() and markers[-1].stem != "step-004657":
+    if markers and not (run / "selected.json").exists():
+        final_pending = markers[-1].stem == "step-004657" and completed_selection(run,4657) is None
+    else:
+        final_pending = False
+    if markers and not (run / "selected.json").exists() and (markers[-1].stem != "step-004657" or final_pending):
         checkpoint_protocol = json.loads((run / "protocol.json").read_text())
         recorded = not checkpoint_protocol.get("overlap_comm", True)
         if setting is not None and no_overlap != recorded:
@@ -223,13 +229,16 @@ def launch(work):
     if not choice:
         raise RuntimeError("Missing speed_selection.json for existing training checkpoints")
     if not has_progress:
+        if run is not None:
+            print(f"No committed checkpoint in {run}; its output is preserved. The new run starts at step 0 after a full validation preflight.", flush=True)
         run = runs / f"full-{len(attempts)+1:04d}"
     print(f"Selected {choice['winner']}; training run: {run}", flush=True)
     last = markers[-1] if markers else None
     # The final step marker is durable before train.py writes selected.json.
     if last and last.stem == "step-004657" and not (run / "selected.json").exists():
-        best = json.loads(last.read_text())["best"]
-        write_json(run / "selected.json", dict(best, tag=f"step-{best['step']:06d}"))
+        selected = completed_selection(run,4657)
+        if selected is not None:
+            write_json(run / "selected.json", selected)
     if (run / "selected.json").exists():
         subprocess.run(
             [py, str(BASE / "sp" / "pipeline.py"), *inputs, "--output", str(run)], check=True

@@ -19,6 +19,8 @@ from train_model import FrozenEncoders
 from model_buffers import snapshot_buffers, restore_buffers
 from wan_sdpa import configure_attention
 from numerics import NumericalChecks
+from validation import validate
+from validation_checkpoint import save_training_checkpoint, write_validation_receipt, resume_validation
 
 parser = argparse.ArgumentParser()
 for name in ("qwen", "wan", "data", "output"):
@@ -147,11 +149,13 @@ if args.diagnose_numerics:
         module.register_forward_hook(trace_output)
 start=0
 best=None
+pending_validation=False
 if args.resume:
     loaded,state=engine.load_checkpoint(str(out/"checkpoints"),tag=args.resume,load_module_strict=not args.smoke)
     if not loaded or state["protocol"]!=protocol:
         raise ValueError("Checkpoint does not match the run")
-    start=state["step"];best=state["best"]
+    start=state["step"]
+    best,pending_validation=resume_validation(out,state)
     assert engine.global_steps==start
 checks.attach(optimizer)
 for row in rows+tune:
@@ -180,10 +184,11 @@ def loader(split,indices,batch_size):
     return DataLoader(Examples(split,indices),batch_size=batch_size,num_workers=args.workers,
                       pin_memory=True,collate_fn=as_list)
 
-def forward(batch,phase):
+def forward(batch,phase,progress=None):
     features=[]
     for qid,_,example in batch:
         torch.manual_seed(sample_seed(qid,0,phase))
+        if progress is not None:progress("encode")
         feature = enc.encode(example,device)
         if args.diagnose_numerics:
             tensors = [(qid + "/wan", feature["wan"])]
@@ -193,13 +198,39 @@ def forward(batch,phase):
                            for j, v in enumerate(layer))
             checks.check_tensors(tensors, "frozen_features")
         features.append(feature)
+    if progress is not None:
+        torch.cuda.synchronize(device)
+        progress("forward")
     return engine(**features[0]).reshape(1) if len(features)==1 else engine(examples=features)
+
 
 indices=[]
 for pos in range(start*effective_batch,total*effective_batch,world*width):
     for i in range(pos+rank*width,pos+(rank+1)*width):
         indices.append((order[min(i,len(rows)-1)],i<len(rows)))
-batches=iter(loader(rows,indices,width))
+batches=iter(loader(rows,indices,width)) if start<total else None
+if pending_validation:
+    engine.eval()
+    event=dict(state["event"])
+    event["tune_ce"]=validate(tune,processor,prepare,forward,rank=rank,world=world,device=device,step=start)
+    if best is None or event["tune_ce"]<best["tune_ce"]:
+        best={"step":start,"tune_ce":event["tune_ce"]}
+    if rank==0:
+        write_validation_receipt(out,start,event,best)
+        print("STEP",json.dumps(event),flush=True)
+        with (out/"metrics.jsonl").open("a") as f:f.write(json.dumps(event)+"\n")
+    engine.train()
+elif not args.resume and args.benchmark_steps is None and not args.smoke:
+    # Exercise every validation media item before spending a quarter epoch on
+    # training. This uses initial weights, does no updates and is not selection.
+    engine.eval()
+    preflight_ce=validate(tune,processor,prepare,forward,rank=rank,world=world,device=device,step=0)
+    if rank==0:
+        with (out/"validation-preflight.json").open("x") as f:
+            json.dump({"questions":len(tune),"initial_weight_ce":preflight_ce,"optimizer_updates":engine.global_steps},f)
+        print("VALIDATION_PREFLIGHT_COMPLETE",len(tune),flush=True)
+    engine.train()
+
 if rank==0:print("READY",json.dumps(dict(protocol,trainable=sum(p.numel() for _,p in params),start=start)),flush=True)
 measured_seconds=[]
 measured_examples=0
@@ -217,6 +248,7 @@ if args.benchmark_steps is not None and args.diagnostic_micros is None:
             free_bytes.append(pynvml.nvmlDeviceGetMemoryInfo(handle).free)
             sampling_done.wait(.5)
     monitor=threading.Thread(target=sample_gpu,daemon=True)
+completed=start
 for step in range(start,args.benchmark_steps or total):
     if args.benchmark_steps is not None and step==1:
         monitor.start()
@@ -271,32 +303,22 @@ for step in range(start,args.benchmark_steps or total):
         measured_seconds.append(elapsed)
         measured_examples+=n
     if args.benchmark_steps is None and completed in validation_steps:
+        save_training_checkpoint(engine,out,protocol,completed,best,rank=rank,barrier=dist.barrier,
+                                 pending_validation=True,event=event,exclude_frozen_parameters=args.smoke)
+        if rank==0:print("CHECKPOINT_BEFORE_VALIDATION",completed,flush=True)
         engine.eval()
-        # Match standalone export verification even when training uses padded batches.
-        count=math.ceil(len(tune)/world)*world
-        slots=[(min(i,len(tune)-1),i<len(tune)) for i in range(rank,count,world)]
-        stats=torch.zeros(2,device=device,dtype=torch.float64)
-        with torch.no_grad():
-            for batch in loader(tune,slots,1):
-                values=forward(batch,"validation")
-                valid=sum(item[1] for item in batch)
-                stats[0]+=values[:valid].double().sum();stats[1]+=valid
-        dist.all_reduce(stats)
-        if stats[1].item()!=len(tune) or not torch.isfinite(stats[0]):raise ValueError("Invalid validation reduction")
-        event["tune_ce"]=(stats[0]/stats[1]).item()
+        event["tune_ce"]=validate(tune,processor,prepare,forward,rank=rank,world=world,device=device,step=completed)
         if best is None or event["tune_ce"]<best["tune_ce"]:
             best={"step":completed,"tune_ce":event["tune_ce"]}
+        if rank==0:write_validation_receipt(out,completed,event,best)
         engine.train()
     if rank==0:
         print("STEP",json.dumps(event),flush=True)
         with (out/"metrics.jsonl").open("a") as f:f.write(json.dumps(event)+"\n")
-    if args.benchmark_steps is None and (completed in validation_steps or completed % args.save_every==0 or completed==args.stop_after):
-        tag=f"step-{completed:06d}"
-        engine.save_checkpoint(str(out/"checkpoints"),tag=tag,save_latest=False,exclude_frozen_parameters=args.smoke,
-                               client_state={"protocol":protocol,"step":completed,"best":best})
-        dist.barrier()
-        if rank==0:
-            with (out/(tag+".json")).open("x") as f:json.dump({"step":completed,"best":best},f)
+    if (args.benchmark_steps is None and completed not in validation_steps
+            and (completed % args.save_every==0 or completed==args.stop_after)):
+        save_training_checkpoint(engine,out,protocol,completed,best,rank=rank,barrier=dist.barrier,
+                                 exclude_frozen_parameters=args.smoke)
     if completed==args.stop_after:break
 if args.benchmark_steps is not None:
     sampling_done.set()

@@ -237,6 +237,40 @@ class OneClickTest(unittest.TestCase):
         self.assertTrue(self.calls[-1][1].endswith("pipeline.py"))
         self.assertEqual(json.loads((out / "selected.json").read_text())["tag"], "step-002329")
 
+    def test_final_pending_checkpoint_resumes_validation_before_downstream(self):
+        out = self.work / "runs" / "full-0001"
+        out.mkdir(parents=True)
+        one_click.write_json(out / "protocol.json", {"overlap_comm": False})
+        one_click.write_json(out / "step-004657.json", {
+            "step":4657,"pending_validation":True,"best":{"step":2329,"tune_ce":1.2},
+            "event":{"step":4657,"train_ce":.3},
+        })
+        one_click.write_json(self.work / "speed_selection.json", {
+            "winner":{"micro_batch":1,"checkpoint_every":1},"overlap_comm":False,
+        })
+        os.environ.pop("VEGA_NO_OVERLAP")
+        one_click.launch(self.work)
+        self.assertFalse((out / "selected.json").exists())
+        self.assertEqual(self.calls[-1][-2:], ["--resume","step-004657"])
+        self.assertIn("--no-overlap",self.calls[-1])
+        self.assertFalse(any(cmd[1].endswith("pipeline.py") for cmd in self.calls))
+
+    def test_final_receipt_recovers_new_best_not_stale_checkpoint_best(self):
+        out = self.work / "runs" / "full-0001"
+        out.mkdir(parents=True)
+        one_click.write_json(out / "step-004657.json", {
+            "step":4657,"pending_validation":True,"best":{"step":2329,"tune_ce":1.2},
+        })
+        one_click.write_json(out / "validation-004657.json", {
+            "step":4657,"event":{"step":4657,"tune_ce":1.1},"best":{"step":4657,"tune_ce":1.1},
+        })
+        one_click.write_json(self.work / "speed_selection.json", {
+            "winner":{"micro_batch":1,"checkpoint_every":1},
+        })
+        one_click.launch(self.work)
+        self.assertTrue(self.calls[-1][1].endswith("pipeline.py"))
+        self.assertEqual(json.loads((out / "selected.json").read_text())["tag"],"step-004657")
+
     def test_no_overlap_reaches_every_trial_training_and_resume(self):
         os.environ["VEGA_NO_OVERLAP"] = "1"
         self.interrupt = True
